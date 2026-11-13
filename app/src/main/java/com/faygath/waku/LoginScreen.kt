@@ -62,6 +62,67 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
 
+// Si está en true: la cuenta queda casada con el PRIMER celular que inicie sesión (nadie más puede entrar).
+// Si lo pasas a false: deja entrar al celular nuevo, pero expulsa en tiempo real al celular anterior.
+private const val STRICT_HARDWARE_LOCK = true
+
+fun getUniqueDeviceId(context: android.content.Context): String {
+    return android.provider.Settings.Secure.getString(
+        context.contentResolver,
+        android.provider.Settings.Secure.ANDROID_ID
+    ) ?: "unknown_device"
+}
+
+private fun verifyOrBindDeviceOnLogin(
+    context: android.content.Context,
+    db: com.google.firebase.firestore.FirebaseFirestore,
+    auth: com.google.firebase.auth.FirebaseAuth,
+    onSuccess: () -> Unit,
+    onError: (String) -> Unit
+) {
+    val uid = auth.currentUser?.uid
+    if (uid == null) {
+        onError("No se pudo verificar la sesión")
+        return
+    }
+
+    val currentDeviceId = getUniqueDeviceId(context)
+    val currentDeviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+    val userRef = db.collection("usuarios").document(uid)
+
+    userRef.get()
+        .addOnSuccessListener { doc ->
+            if (doc.getBoolean("bloqueado") == true) {
+                auth.signOut()
+                onError("Esta cuenta ha sido suspendida por el administrador.")
+                return@addOnSuccessListener
+            }
+
+            val boundDeviceId = doc.getString("boundDeviceId")
+            val boundDeviceName = doc.getString("boundDeviceName") ?: "otro teléfono"
+
+            if (boundDeviceId.isNullOrBlank() || !STRICT_HARDWARE_LOCK || boundDeviceId == currentDeviceId) {
+                // Es su primer inicio de sesión o es su mismo teléfono: registramos/actualizamos y damos acceso
+                val updateData = mapOf(
+                    "boundDeviceId" to currentDeviceId,
+                    "boundDeviceName" to currentDeviceModel,
+                    "lastLoginAt" to System.currentTimeMillis()
+                )
+                userRef.set(updateData, com.google.firebase.firestore.SetOptions.merge())
+                    .addOnSuccessListener { onSuccess() }
+                    .addOnFailureListener { onSuccess() }
+            } else {
+                // Otro celular intentando usar una cuenta ajena: lo bloqueamos y cerramos sesión
+                auth.signOut()
+                onError("Cuenta ya vinculada a $boundDeviceName. No se permite compartir cuentas.")
+            }
+        }
+        .addOnFailureListener {
+            auth.signOut()
+            onError("Error al verificar el dispositivo autorizado")
+        }
+}
+
 @Composable
 fun LoginScreen(
     onLoginSuccess: () -> Unit,
@@ -75,6 +136,8 @@ fun LoginScreen(
 
     val auth = remember { FirebaseAuth.getInstance() }
     val db = remember { FirebaseFirestore.getInstance() }
+
+    val context = LocalContext.current
 
     val configuration = LocalConfiguration.current
     val topSpacerHeight = (configuration.screenHeightDp * 0.38f).dp
@@ -319,12 +382,31 @@ fun LoginScreen(
                             isLoading = true
                             errorMessage = null
 
+                            val handlePostAuth = {
+                                verifyOrBindDeviceOnLogin(
+                                    context = context,
+                                    db = db,
+                                    auth = auth,
+                                    onSuccess = {
+                                        isLoading = false
+                                        onLoginSuccess()
+                                    },
+                                    onError = { msg ->
+                                        isLoading = false
+                                        errorMessage = msg
+                                    }
+                                )
+                            }
+
                             if (input.contains("@")) {
                                 auth.signInWithEmailAndPassword(input, pass)
                                     .addOnCompleteListener { task ->
-                                        isLoading = false
-                                        if (task.isSuccessful) onLoginSuccess()
-                                        else errorMessage = "Credenciales incorrectas o cuenta no autorizada"
+                                        if (task.isSuccessful) {
+                                            handlePostAuth()
+                                        } else {
+                                            isLoading = false
+                                            errorMessage = "Credenciales incorrectas o cuenta no autorizada"
+                                        }
                                     }
                             } else {
                                 db.collection("usuarios")
@@ -336,9 +418,12 @@ fun LoginScreen(
                                         if (!email.isNullOrEmpty()) {
                                             auth.signInWithEmailAndPassword(email, pass)
                                                 .addOnCompleteListener { task ->
-                                                    isLoading = false
-                                                    if (task.isSuccessful) onLoginSuccess()
-                                                    else errorMessage = "Contraseña incorrecta"
+                                                    if (task.isSuccessful) {
+                                                        handlePostAuth()
+                                                    } else {
+                                                        isLoading = false
+                                                        errorMessage = "Contraseña incorrecta"
+                                                    }
                                                 }
                                         } else {
                                             isLoading = false

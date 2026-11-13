@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
 
-    <style name="Theme.Waku" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.Waku" parent="android:Theme.Material.NoActionBar">
+        <!-- Elimina el destello blanco en cualquier versión de Android -->
+        <item name="android:windowBackground">#16110F</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">#120D0B</item>
+
+        <!-- Configuración del Splash Screen nativo (Android 12 en adelante) -->
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">#16110F</item>
+        <item name="android:windowSplashScreenIconBackgroundColor" tools:targetApi="s">#16110F</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="s">@mipmap/ic_launcher_foreground</item>
+    </style>
+
 </resources>

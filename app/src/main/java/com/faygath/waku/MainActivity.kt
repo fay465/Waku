@@ -48,6 +48,47 @@ class MainActivity : ComponentActivity() {
                 val navController = rememberNavController()
                 val startRoute = if (FirebaseAuth.getInstance().currentUser != null) "home" else "login"
 
+                // Vigilante en tiempo real: verifica que este dispositivo siga siendo el único autorizado
+                androidx.compose.runtime.DisposableEffect(Unit) {
+                    val auth = FirebaseAuth.getInstance()
+                    val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+                    val myDeviceId = getUniqueDeviceId(this@MainActivity)
+                    var firestoreListener: com.google.firebase.firestore.ListenerRegistration? = null
+
+                    val authListener = FirebaseAuth.AuthStateListener { firebaseAuth ->
+                        firestoreListener?.remove()
+                        val user = firebaseAuth.currentUser
+                        if (user != null) {
+                            firestoreListener = db.collection("usuarios").document(user.uid)
+                                .addSnapshotListener { snap, _ ->
+                                    if (snap != null && snap.exists()) {
+                                        val boundId = snap.getString("boundDeviceId")
+                                        val isBlocked = snap.getBoolean("bloqueado") == true
+
+                                        if (isBlocked || (!boundId.isNullOrBlank() && boundId != myDeviceId)) {
+                                            firebaseAuth.signOut()
+                                            android.widget.Toast.makeText(
+                                                this@MainActivity,
+                                                if (isBlocked) "Tu cuenta fue suspendida."
+                                                else "Sesión cerrada: esta cuenta está vinculada a otro dispositivo.",
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                            navController.navigate("login") {
+                                                popUpTo(0) { inclusive = true }
+                                            }
+                                        }
+                                    }
+                                }
+                        }
+                    }
+
+                    auth.addAuthStateListener(authListener)
+                    onDispose {
+                        firestoreListener?.remove()
+                        auth.removeAuthStateListener(authListener)
+                    }
+                }
+
                 val navigateBottomTab: (String) -> Unit = { route ->
                     when (route) {
                         "catalogo_search" -> {
