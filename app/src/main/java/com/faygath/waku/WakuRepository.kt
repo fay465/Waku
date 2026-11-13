@@ -1163,6 +1163,7 @@ object WakuRepository {
     private fun fetchAniListMeta(malId: Int?, title: String): AniListMeta? {
         val cacheKey = if (malId != null && malId > 0) "mal_$malId" else "title_$title"
         aniListMetaCache[cacheKey]?.let { return it }
+        if (System.currentTimeMillis() < aniListCooldownUntil) return null
 
         return runCatching {
             val queryField = if (malId != null && malId > 0) {
@@ -1181,6 +1182,10 @@ object WakuRepository {
                 .build()
 
             client.newCall(req).execute().use { resp ->
+                if (resp.code == 429) {
+                    aniListCooldownUntil = System.currentTimeMillis() + 45_000L
+                    return null
+                }
                 if (!resp.isSuccessful) return null
                 val root =
                     JsonParser.parseString(resp.body?.string().orEmpty()).asSafeObj() ?: return null
@@ -2098,12 +2103,11 @@ object WakuRepository {
             }
 
             // 2. Enriquecer solo póster HD y total de episodios en paralelo sin alterar el día ni la hora de AnimeAV1
-            val semaphore = Semaphore(8)
             val scheduleItems = coroutineScope {
                 rawEntries.map { entry ->
                     async {
-                        semaphore.withPermit {
-                            val aniInfo = fetchAniListScheduleInfo(entry.title)
+                        aniListBgSemaphore.withPermit {
+                            val aniInfo = fetchAniListScheduleInfo(context, entry.title)
                             val posterUrl = aniInfo?.posterUrl
                                 ?: "https://cdn.animeav1.com/covers/${entry.animeId}.jpg"
                             val totalEps = aniInfo?.totalEpisodes
@@ -2208,9 +2212,26 @@ object WakuRepository {
     )
 
     private val aniScheduleCache = ConcurrentHashMap<String, AniListScheduleMeta>()
+    // Freno global: solo permite 2 consultas simultáneas en segundo plano y pausa si AniList da 429
+    private val aniListBgSemaphore = Semaphore(2)
+    @Volatile
+    private var aniListCooldownUntil: Long = 0L
 
-    private fun fetchAniListScheduleInfo(title: String): AniListScheduleMeta? {
+    private fun fetchAniListScheduleInfo(context: Context, title: String): AniListScheduleMeta? {
         aniScheduleCache[title]?.let { return it }
+
+        val prefs = context.getSharedPreferences("waku_schedule_cache_v1", Context.MODE_PRIVATE)
+        val cachedStr = prefs.getString("sched_$title", null)
+        if (cachedStr != null) {
+            val parts = cachedStr.split("|")
+            val poster = parts.getOrNull(0)?.takeIf { it.isNotBlank() }
+            val eps = parts.getOrNull(1)?.toIntOrNull()
+            return AniListScheduleMeta(poster, eps).also { aniScheduleCache[title] = it }
+        }
+
+        // Si AniList está en enfriamiento por 429, no gastamos más peticiones en segundo plano
+        if (System.currentTimeMillis() < aniListCooldownUntil) return null
+
         return runCatching {
             val escaped = title.replace("\"", "\\\"")
             val queryJson =
@@ -2218,10 +2239,15 @@ object WakuRepository {
             val body = queryJson.toRequestBody("application/json; charset=utf-8".toMediaType())
             val req = Request.Builder()
                 .url("https://graphql.anilist.co")
+                .header("User-Agent", USER_AGENT)
                 .post(body)
                 .build()
 
             client.newCall(req).execute().use { resp ->
+                if (resp.code == 429) {
+                    aniListCooldownUntil = System.currentTimeMillis() + 45_000L
+                    return null
+                }
                 if (!resp.isSuccessful) return null
                 val root =
                     JsonParser.parseString(resp.body?.string().orEmpty()).asSafeObj() ?: return null
@@ -2230,6 +2256,10 @@ object WakuRepository {
                 val totalEps = media.safeInt("episodes")
                 val poster = media.safeObj("coverImage")?.safeString("extraLarge")
 
+                prefs.edit()
+                    .putString("sched_$title", "${poster.orEmpty()}|${totalEps ?: ""}")
+                    .apply()
+
                 AniListScheduleMeta(
                     posterUrl = poster,
                     totalEpisodes = totalEps
@@ -2237,21 +2267,25 @@ object WakuRepository {
             }
         }.getOrNull()
     }
+
     // =========================================================================
-    // SELECTOR DE AVATARES POR SERIE (AniList GraphQL Characters)
-    // =========================================================================
-    // =========================================================================
-    // SELECTOR DE AVATARES POR SERIE (AniList GraphQL Characters)
+    // SELECTOR DE AVATARES POR SERIE (100% AniList con Caché y Reintento Anti-429)
     // =========================================================================
     private var defaultAvatarGroupsCache: List<SeriesAvatarGroup>? = null
+    private val avatarSearchCache = ConcurrentHashMap<String, List<SeriesAvatarGroup>>()
 
     suspend fun fetchCharacterAvatarsBySeries(
         searchQuery: String = ""
     ): Result<List<SeriesAvatarGroup>> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanQuery = searchQuery.trim()
+            val cacheKey = cleanQuery.lowercase()
+
             if (cleanQuery.isEmpty() && !defaultAvatarGroupsCache.isNullOrEmpty()) {
                 return@runCatching defaultAvatarGroupsCache!!
+            }
+            avatarSearchCache[cacheKey]?.let { cached ->
+                if (cached.isNotEmpty()) return@runCatching cached
             }
 
             val graphqlQuery = if (cleanQuery.isEmpty()) {
@@ -2300,19 +2334,38 @@ object WakuRepository {
                 """.trimIndent()
             }
 
-            // Usamos JsonObject de Gson para serializar el string con escape JSON 100% válido
             val payload = JsonObject().apply {
                 addProperty("query", graphqlQuery)
             }.toString()
 
-            val body = payload.toRequestBody("application/json; charset=utf-8".toMediaType())
-            val req = Request.Builder()
-                .url("https://graphql.anilist.co")
-                .post(body)
-                .build()
+            fun executeAniListAvatarRequest(): okhttp3.Response {
+                val body = payload.toRequestBody("application/json; charset=utf-8".toMediaType())
+                val req = Request.Builder()
+                    .url("https://graphql.anilist.co")
+                    .header("User-Agent", USER_AGENT)
+                    .post(body)
+                    .build()
+                return client.newCall(req).execute()
+            }
 
-            val groups = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) error("Error HTTP ${resp.code} al buscar en AniList")
+            var response = executeAniListAvatarRequest()
+
+            // Si justo había un pico de peticiones (429), pausamos las tareas de fondo, esperamos 2.2s y reintentamos
+            if (response.code == 429) {
+                response.close()
+                aniListCooldownUntil = System.currentTimeMillis() + 45_000L
+                kotlinx.coroutines.delay(2200)
+                response = executeAniListAvatarRequest()
+            }
+
+            val groups = response.use { resp ->
+                if (!resp.isSuccessful) {
+                    if (resp.code == 429) {
+                        error("AniList está recibiendo muchas consultas. Espera unos segundos y vuelve a intentar.")
+                    } else {
+                        error("Error HTTP ${resp.code} al buscar en AniList")
+                    }
+                }
                 val root = JsonParser.parseString(resp.body?.string().orEmpty()).asSafeObj()
                     ?: error("Respuesta vacía de AniList")
 
@@ -2320,7 +2373,6 @@ object WakuRepository {
                 val resultGroups = mutableListOf<SeriesAvatarGroup>()
                 val seenCharIds = HashSet<Int>()
 
-                // 1. Si el usuario buscó el nombre directo de un personaje (ej. "Gojo", "Luffy"), lo mostramos arriba
                 if (cleanQuery.isNotEmpty()) {
                     val directCharsArray = dataObj.safeObj("byCharacter")?.safeArray("characters")
                     if (directCharsArray != null) {
@@ -2348,7 +2400,6 @@ object WakuRepository {
                     }
                 }
 
-                // 2. Agrupar por serie de anime
                 val mediaArray = dataObj.safeObj("bySeries")?.safeArray("media") ?: JsonArray()
                 val minCharsRequired = if (cleanQuery.isEmpty()) 3 else 1
 
@@ -2390,8 +2441,11 @@ object WakuRepository {
                 resultGroups
             }
 
-            if (cleanQuery.isEmpty() && groups.isNotEmpty()) {
-                defaultAvatarGroupsCache = groups
+            if (groups.isNotEmpty()) {
+                if (cleanQuery.isEmpty()) {
+                    defaultAvatarGroupsCache = groups
+                }
+                avatarSearchCache[cacheKey] = groups
             }
             groups
         }

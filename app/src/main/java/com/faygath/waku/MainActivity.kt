@@ -48,7 +48,7 @@ class MainActivity : ComponentActivity() {
                 val navController = rememberNavController()
                 val startRoute = if (FirebaseAuth.getInstance().currentUser != null) "home" else "login"
 
-                // Vigilante en tiempo real: verifica que este dispositivo siga siendo el único autorizado
+                // Vigilante en tiempo real: verifica que este dispositivo esté dentro de los 2 autorizados
                 androidx.compose.runtime.DisposableEffect(Unit) {
                     val auth = FirebaseAuth.getInstance()
                     val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
@@ -62,15 +62,26 @@ class MainActivity : ComponentActivity() {
                             firestoreListener = db.collection("usuarios").document(user.uid)
                                 .addSnapshotListener { snap, _ ->
                                     if (snap != null && snap.exists()) {
-                                        val boundId = snap.getString("boundDeviceId")
                                         val isBlocked = snap.getBoolean("bloqueado") == true
 
-                                        if (isBlocked || (!boundId.isNullOrBlank() && boundId != myDeviceId)) {
+                                        val boundIds = (snap.get("boundDeviceIds") as? List<*>)
+                                            ?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
+                                            .orEmpty()
+                                        val legacyId = snap.getString("boundDeviceId")?.trim()?.takeIf { it.isNotEmpty() }
+
+                                        val effectiveAllowedIds = when {
+                                            boundIds.isNotEmpty() -> boundIds
+                                            legacyId != null -> listOf(legacyId)
+                                            else -> emptyList()
+                                        }
+
+                                        // Si la lista existe y este dispositivo no está en ella (o la cuenta fue bloqueada), cerramos sesión
+                                        if (isBlocked || (effectiveAllowedIds.isNotEmpty() && myDeviceId !in effectiveAllowedIds)) {
                                             firebaseAuth.signOut()
                                             android.widget.Toast.makeText(
                                                 this@MainActivity,
                                                 if (isBlocked) "Tu cuenta fue suspendida."
-                                                else "Sesión cerrada: esta cuenta está vinculada a otro dispositivo.",
+                                                else "Sesión cerrada: este dispositivo ya no está vinculado a la cuenta.",
                                                 android.widget.Toast.LENGTH_LONG
                                             ).show()
                                             navController.navigate("login") {

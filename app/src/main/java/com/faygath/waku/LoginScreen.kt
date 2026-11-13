@@ -65,6 +65,7 @@ import java.net.URL
 // Si está en true: la cuenta queda casada con el PRIMER celular que inicie sesión (nadie más puede entrar).
 // Si lo pasas a false: deja entrar al celular nuevo, pero expulsa en tiempo real al celular anterior.
 private const val STRICT_HARDWARE_LOCK = true
+private const val DEFAULT_MAX_DEVICES = 2
 
 fun getUniqueDeviceId(context: android.content.Context): String {
     return android.provider.Settings.Secure.getString(
@@ -98,28 +99,78 @@ private fun verifyOrBindDeviceOnLogin(
                 return@addOnSuccessListener
             }
 
-            val boundDeviceId = doc.getString("boundDeviceId")
-            val boundDeviceName = doc.getString("boundDeviceName") ?: "otro teléfono"
+            // Límite por defecto: 2 dispositivos (o el número que pongas en el campo "maxDevices" en Firestore)
+            val maxAllowed = doc.getLong("maxDevices")?.toInt()?.coerceAtLeast(1) ?: DEFAULT_MAX_DEVICES
 
-            if (boundDeviceId.isNullOrBlank() || !STRICT_HARDWARE_LOCK || boundDeviceId == currentDeviceId) {
-                // Es su primer inicio de sesión o es su mismo teléfono: registramos/actualizamos y damos acceso
+            // Leer lista actual de IDs y modelos (con compatibilidad por si ya existía boundDeviceId antiguo)
+            val rawIds = (doc.get("boundDeviceIds") as? List<*>)
+                ?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
+                .orEmpty()
+            val rawNames = (doc.get("boundDeviceNames") as? List<*>)
+                ?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
+                .orEmpty()
+
+            val legacyId = doc.getString("boundDeviceId")?.trim()?.takeIf { it.isNotEmpty() }
+            val legacyName = doc.getString("boundDeviceName")?.trim()?.takeIf { it.isNotEmpty() }
+
+            val boundIds = when {
+                rawIds.isNotEmpty() -> rawIds.toMutableList()
+                legacyId != null -> mutableListOf(legacyId)
+                else -> mutableListOf()
+            }
+            val boundNames = when {
+                rawNames.isNotEmpty() -> rawNames.toMutableList()
+                legacyName != null -> mutableListOf(legacyName)
+                else -> mutableListOf()
+            }
+
+            val existingIndex = boundIds.indexOf(currentDeviceId)
+
+            if (existingIndex != -1) {
+                // Caso 1: Este dispositivo (celular o tablet) ya es uno de los 2 autorizados
+                if (existingIndex < boundNames.size) {
+                    boundNames[existingIndex] = currentDeviceModel
+                } else {
+                    boundNames.add(currentDeviceModel)
+                }
+
                 val updateData = mapOf(
-                    "boundDeviceId" to currentDeviceId,
-                    "boundDeviceName" to currentDeviceModel,
+                    "boundDeviceIds" to boundIds,
+                    "boundDeviceNames" to boundNames,
                     "lastLoginAt" to System.currentTimeMillis()
                 )
                 userRef.set(updateData, com.google.firebase.firestore.SetOptions.merge())
                     .addOnSuccessListener { onSuccess() }
                     .addOnFailureListener { onSuccess() }
+
+            } else if (boundIds.size < maxAllowed || !STRICT_HARDWARE_LOCK) {
+                // Caso 2: Aún tiene cupo libre (ej. tenía 0/2 o 1/2 dispositivos) -> registramos este nuevo
+                boundIds.add(currentDeviceId)
+                boundNames.add(currentDeviceModel)
+
+                val updateData = mapOf(
+                    "boundDeviceIds" to boundIds,
+                    "boundDeviceNames" to boundNames,
+                    "lastLoginAt" to System.currentTimeMillis()
+                )
+                userRef.set(updateData, com.google.firebase.firestore.SetOptions.merge())
+                    .addOnSuccessListener { onSuccess() }
+                    .addOnFailureListener { onSuccess() }
+
             } else {
-                // Otro celular intentando usar una cuenta ajena: lo bloqueamos y cerramos sesión
+                // Caso 3: Ya ocupó sus 2 cupos e intenta entrar un 3er dispositivo
                 auth.signOut()
-                onError("Cuenta ya vinculada a $boundDeviceName. No se permite compartir cuentas.")
+                val registeredDevicesText = if (boundNames.isNotEmpty()) {
+                    boundNames.joinToString(" y ")
+                } else {
+                    "$maxAllowed dispositivos"
+                }
+                onError("Límite alcanzado ($maxAllowed/$maxAllowed): cuenta vinculada a $registeredDevicesText.")
             }
         }
         .addOnFailureListener {
             auth.signOut()
-            onError("Error al verificar el dispositivo autorizado")
+            onError("Error al verificar los dispositivos autorizados")
         }
 }
 
