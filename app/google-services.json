@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "570714552760",
+    "project_id": "waku-anime",
+    "storage_bucket": "waku-anime.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:570714552760:android:a870b40d909cf7f018b74d",
+        "android_client_info": {
+          "package_name": "com.faygath.waku"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBytcI8Cppl0OZr8S2Jg8u_Yf-qBnTTsuw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
