@@ -111,7 +111,9 @@ private fun verifyOrBindDeviceOnLogin(
                 return@addOnSuccessListener
             }
 
-            val maxAllowed = doc.getLong("maxDevices")?.toInt()?.coerceAtLeast(1) ?: DEFAULT_MAX_DEVICES
+            // Mínimo estricto de 2 dispositivos; si en Firebase pusiste 3, 4, etc., se respeta e inyecta ese valor mayor
+            val remoteMax = doc.getLong("maxDevices")?.toInt() ?: DEFAULT_MAX_DEVICES
+            val maxAllowed = maxOf(remoteMax, DEFAULT_MAX_DEVICES)
 
             val rawIds = (doc.get("boundDeviceIds") as? List<*>)
                 ?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
@@ -162,6 +164,7 @@ private fun verifyOrBindDeviceOnLogin(
                 val updateData = mutableMapOf<String, Any>(
                     "boundDeviceIds" to boundIds,
                     "boundDeviceNames" to boundNames,
+                    "maxDevices" to maxAllowed,
                     "lastLoginAt" to now
                 )
 
@@ -486,8 +489,12 @@ fun LoginScreen(
                                         }
                                     }
                             } else {
+                                val capitalizedInput = input.replaceFirstChar { it.uppercase() }
+                                val lowerInput = input.lowercase()
+                                val candidates = listOf(input, capitalizedInput, lowerInput).distinct()
+
                                 db.collection("usuarios")
-                                    .whereEqualTo("username", input)
+                                    .whereIn("username", candidates)
                                     .limit(1)
                                     .get()
                                     .addOnSuccessListener { snapshot ->

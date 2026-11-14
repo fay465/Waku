@@ -99,6 +99,7 @@ fun MyListScreen(
 
     var allEntries by remember { mutableStateOf<List<UserAnimeEntry>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+    val enrichedSessionIds = remember { mutableSetOf<String>() }
     // Estado para nuestra notificación personalizada (reemplaza al Toast nativo de Android)
     var noticeMessage by remember { mutableStateOf<String?>(null) }
 
@@ -180,7 +181,7 @@ fun MyListScreen(
 
                     // Enriquecer en segundo plano cualquier entrada a la que le falten metadatos (totalEpisodes o género)
                     parsed.filter { it.totalEpisodes == 0 || it.primaryGenre == "Anime" }.forEach { incomplete ->
-                        if (incomplete.slug.isNotBlank()) {
+                        if (incomplete.slug.isNotBlank() && enrichedSessionIds.add(incomplete.docId)) {
                             coroutineScope.launch {
                                 val dummyCatalogItem = CatalogAnimeItem(
                                     animeId = incomplete.animeId,

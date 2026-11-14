@@ -95,7 +95,7 @@ fun HomeScreen(
                 .addSnapshotListener { snap, _ ->
                     if (snap != null) {
                         val favs = mutableSetOf<Int>()
-                        val watching = mutableListOf<ContinueWatchingItem>()
+                        val watchingPairs = mutableListOf<Pair<Long, ContinueWatchingItem>>()
 
                         for (doc in snap.documents) {
                             val animeId = doc.getLong("animeId")?.toInt()
@@ -104,8 +104,9 @@ fun HomeScreen(
                                 favs.add(animeId)
                             }
                             if (doc.getString("estado") == "VIENDO") {
-                                watching.add(
-                                    ContinueWatchingItem(
+                                val updatedAt = doc.getLong("updatedAt") ?: 0L
+                                watchingPairs.add(
+                                    updatedAt to ContinueWatchingItem(
                                         animeId = animeId,
                                         slug = doc.getString("slug").orEmpty(),
                                         title = doc.getString("title").orEmpty(),
@@ -121,7 +122,7 @@ fun HomeScreen(
                             }
                         }
                         favoriteIds = favs
-                        continueWatchingList = watching
+                        continueWatchingList = watchingPairs.sortedByDescending { it.first }.map { it.second }
                     }
                 }
         }
@@ -229,6 +230,7 @@ fun HomeScreen(
                                             animeId = hero.animeId,
                                             slug = hero.slug,
                                             title = hero.title,
+                                            posterUrl = hero.posterUrl,
                                             episodeNumber = 1,
                                             episodeTitle = "Episodio 1",
                                             imageUrl = "https://cdn.animeav1.com/screenshots/${hero.animeId}/1.jpg"
@@ -1014,6 +1016,7 @@ private fun saveToWatchingFirestore(
     animeId: Int,
     slug: String,
     title: String,
+    posterUrl: String,
     episodeNumber: Int,
     episodeTitle: String,
     imageUrl: String
@@ -1022,6 +1025,7 @@ private fun saveToWatchingFirestore(
         "animeId" to animeId,
         "slug" to slug,
         "title" to title,
+        "posterUrl" to posterUrl,
         "episodioActual" to episodeNumber,
         "episodeTitle" to episodeTitle,
         "imageUrl" to imageUrl,

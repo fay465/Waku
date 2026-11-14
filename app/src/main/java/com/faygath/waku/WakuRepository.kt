@@ -2507,20 +2507,23 @@ object WakuRepository {
             }
 
             // Priorizar siempre HLS primero por defecto
+            // Priorizar siempre HLS -> Voe -> Byse -> MP4Upload, dejando UPNShare al final
             fun sortServersForPlayer(list: List<EpisodeStreamServer>): List<EpisodeStreamServer> {
                 return list.sortedBy { srv ->
                     val n = srv.name.lowercase()
                     val u = srv.embedUrl.lowercase()
                     when {
-                        n.contains("hls") || u.contains("hls") || u.contains("upn") -> 0
-                        n.contains("p2p") -> 1
-                        n.contains("wish") || n.contains("sw") || u.contains("wish") -> 2
-                        n.contains("hide") || n.contains("lions") || u.contains("hide") -> 3
-                        n.contains("moon") || u.contains("filemoon") -> 4
-                        n.contains("voe") || u.contains("voe") -> 5
-                        n.contains("mp4upload") || u.contains("mp4upload") -> 6
-                        n.contains("yourupload") || u.contains("yourupload") -> 7
-                        n.contains("mega") || u.contains("mega.nz") -> 9
+                        n.contains("hls") || u.contains("zilla-networks") -> 0
+                        n.contains("voe") || u.contains("voe") -> 1
+                        n.contains("byse") || u.contains("byse") || u.contains("n1mwq") -> 2
+                        n.contains("mp4upload") || u.contains("mp4upload") -> 3
+                        n.contains("p2p") -> 4
+                        n.contains("wish") || n.contains("sw") || u.contains("wish") -> 5
+                        n.contains("hide") || n.contains("lions") || u.contains("hide") -> 6
+                        n.contains("moon") || u.contains("filemoon") -> 7
+                        n.contains("yourupload") || u.contains("yourupload") -> 8
+                        n.contains("upn") || u.contains("upn") -> 9
+                        n.contains("mega") || u.contains("mega.nz") -> 10
                         else -> 8
                     }
                 }

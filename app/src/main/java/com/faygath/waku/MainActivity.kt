@@ -101,6 +101,7 @@ class MainActivity : ComponentActivity() {
                                             hasAutoHealedProfile = true
                                             val missingFields = mutableMapOf<String, Any>()
                                             val authEmail = user.email?.trim().orEmpty()
+                                            val currentMax = snap.getLong("maxDevices")?.toInt() ?: 0
 
                                             if (snap.getString("email").isNullOrBlank() && authEmail.isNotEmpty()) {
                                                 missingFields["email"] = authEmail
@@ -119,6 +120,9 @@ class MainActivity : ComponentActivity() {
                                             if (effectiveAllowedIds.isEmpty()) {
                                                 missingFields["boundDeviceIds"] = listOf(myDeviceId)
                                                 missingFields["boundDeviceNames"] = listOf(myDeviceModel)
+                                            }
+                                            if (currentMax < 2) {
+                                                missingFields["maxDevices"] = 2
                                             }
                                             if (missingFields.isNotEmpty()) {
                                                 missingFields["updatedAt"] = System.currentTimeMillis()

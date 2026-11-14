@@ -416,6 +416,7 @@ fun VideoPlayerScreen(
         serverFailedMessage = null
         resolvedStreamUrl = null
         hasRestoredPosition = false
+        savedInitialFraction = 0f
         currentPositionMs = 0L
         durationMs = 0L
         exoPlayer.stop()
@@ -1483,7 +1484,8 @@ private fun savePlaybackProgressToFirestore(
         if (data.posterUrl.isNotBlank()) put("posterUrl", data.posterUrl)
         put("totalEpisodes", data.totalEpisodes)
         put("watchedEpisodes", updatedWatched.toList())
-        put("imageUrl", "https://cdn.animeav1.com/screenshots/${data.animeId}/${data.episodeNumber}.jpg")
+        val thumbEp = if (isEpisodeCompleted && data.hasNextEpisode) data.episodeNumber + 1 else data.episodeNumber
+        put("imageUrl", "https://cdn.animeav1.com/screenshots/${data.animeId}/$thumbEp.jpg")
         put("updatedAt", System.currentTimeMillis())
 
         if (allSeriesCompleted) {

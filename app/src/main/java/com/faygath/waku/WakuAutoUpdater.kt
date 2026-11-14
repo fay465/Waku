@@ -211,7 +211,12 @@ private suspend fun downloadApkFile(
         val outFile = File(dir, "Waku-update.apk")
         if (outFile.exists()) outFile.delete()
 
-        val req = Request.Builder().url(apkUrl).build()
+        val req = Request.Builder()
+            .url(apkUrl)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36")
+            .header("Accept", "application/octet-stream, application/vnd.android.package-archive, */*")
+            .build()
+
         WakuRepository.httpClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("HTTP ${resp.code}")
             val body = resp.body ?: error("Archivo vacío")
@@ -219,14 +224,22 @@ private suspend fun downloadApkFile(
 
             body.byteStream().use { input ->
                 FileOutputStream(outFile).use { output ->
-                    val buffer = ByteArray(8 * 1024)
+                    val buffer = ByteArray(16 * 1024)
                     var bytesRead: Int
                     var downloaded = 0L
+                    var lastReportedPercent = -1
+
                     while (input.read(buffer).also { bytesRead = it } != -1) {
                         output.write(buffer, 0, bytesRead)
                         downloaded += bytesRead
-                        if (totalBytes > 0) {
-                            onProgress((downloaded.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f))
+                        if (totalBytes > 0L) {
+                            val currentPercent = ((downloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                            if (currentPercent != lastReportedPercent) {
+                                lastReportedPercent = currentPercent
+                                withContext(Dispatchers.Main) {
+                                    onProgress(currentPercent / 100f)
+                                }
+                            }
                         }
                     }
                     output.flush()
