@@ -7,6 +7,7 @@ import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -75,13 +76,17 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.faygath.waku.ui.theme.*
+import com.google.android.gms.tasks.Tasks
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -89,6 +94,7 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 private fun Context.findActivity(): Activity? {
@@ -102,8 +108,7 @@ private fun Context.findActivity(): Activity? {
 
 /**
  * DataSource personalizado con OkHttp que limpia segmentos HLS camuflados como .html / .jpg / .png
- * (como los 000.html, 001.html, 002.html de PlayerZilla) recortando cualquier byte basura antes del
- * byte de sincronización MPEG-TS (0x47 repetido cada 188 bytes).
+ * e incluye reintentos automáticos ante micro-cortes de red o errores 5xx de Cloudflare/CDN.
  */
 @OptIn(UnstableApi::class)
 private class WakuSegmentSanitizingDataSource(
@@ -125,7 +130,6 @@ private class WakuSegmentSanitizingDataSource(
         currentUri = dataSpec.uri
 
         val isMp4File = lowerUrl.contains(".mp4") && !lowerUrl.contains(".m3u8")
-        // Usamos el cliente estándar para HLS/Voe/Byse y solo usamos streamHttpClient en MP4Upload (:183)
         val activeClient = if (lowerUrl.contains("mp4upload")) {
             WakuRepository.streamHttpClient
         } else {
@@ -158,105 +162,135 @@ private class WakuSegmentSanitizingDataSource(
             return builder.build()
         }
 
-        // Intento 1: Cabeceras originales del extractor
-        var resp = activeClient.newCall(buildBaseRequest(defaultHeaders)).execute()
+        fun executeSingleAttempt(): Response {
+            // Intento 1: Cabeceras originales del extractor
+            var resp = activeClient.newCall(buildBaseRequest(defaultHeaders)).execute()
 
-        // Intento 2 (si da 403/401): Política de navegador strict-origin-when-cross-origin (Referer solo con dominio raíz)
-        if (!resp.isSuccessful && (resp.code == 403 || resp.code == 401)) {
-            resp.close()
-            val refOrigin = defaultHeaders["Origin"] ?: runCatching {
-                val u = Uri.parse(defaultHeaders["Referer"].orEmpty())
-                "${u.scheme}://${u.host}"
-            }.getOrDefault("https://player.zilla-networks.com")
+            // Intento 2 (si da 403/401): Política de navegador strict-origin-when-cross-origin
+            if (!resp.isSuccessful && (resp.code == 403 || resp.code == 401)) {
+                resp.close()
+                val refOrigin = defaultHeaders["Origin"] ?: runCatching {
+                    val u = Uri.parse(defaultHeaders["Referer"].orEmpty())
+                    "${u.scheme}://${u.host}"
+                }.getOrDefault("https://player.zilla-networks.com")
 
-            val crossHeaders = HashMap(defaultHeaders).apply {
-                put("Referer", "$refOrigin/")
-                put("Origin", refOrigin)
-                put("Sec-Fetch-Dest", "empty")
-                put("Sec-Fetch-Mode", "cors")
-                put("Sec-Fetch-Site", "cross-site")
-            }
-            resp = activeClient.newCall(buildBaseRequest(crossHeaders)).execute()
-        }
-
-        // Intento 3 (si sigue 403/401): Origin del propio servidor del segmento
-        if (!resp.isSuccessful && (resp.code == 403 || resp.code == 401)) {
-            resp.close()
-            val segOrigin = runCatching {
-                "${dataSpec.uri.scheme}://${dataSpec.uri.host}"
-            }.getOrDefault("https://player.zilla-networks.com")
-
-            val selfHeaders = mapOf(
-                "Referer" to "$segOrigin/",
-                "Origin" to segOrigin,
-                "Accept" to "*/*"
-            )
-            resp = activeClient.newCall(buildBaseRequest(selfHeaders)).execute()
-        }
-
-        // Intento 4 (si sigue 403/401): Petición limpia sin Referer ni Origin (para buckets S3/R2 pre-firmados)
-        if (!resp.isSuccessful && (resp.code == 403 || resp.code == 401)) {
-            resp.close()
-            resp = activeClient.newCall(buildBaseRequest(mapOf("Accept" to "*/*"))).execute()
-        }
-
-        if (!resp.isSuccessful) {
-            val code = resp.code
-            resp.close()
-            onDiagnosticInfo("HTTP $code en ${urlStr.takeLast(45)}")
-            throw IOException("HTTP $code al abrir $urlStr")
-        }
-
-        response = resp
-        currentUri = Uri.parse(resp.request.url.toString())
-        val body = resp.body ?: throw IOException("Body vacío en $urlStr")
-
-        if (isMp4File) {
-            inputStream = body.byteStream()
-            bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-                dataSpec.length
-            } else {
-                val contentLength = body.contentLength()
-                if (contentLength != -1L) contentLength else C.LENGTH_UNSET.toLong()
-            }
-        } else {
-            val rawBytes = body.bytes()
-            body.close()
-
-            val cleanedBytes = sanitizeHlsPayload(rawBytes, resp.request.url.toString())
-            val startOffset = dataSpec.position.toInt().coerceIn(0, cleanedBytes.size)
-            val available = (cleanedBytes.size - startOffset).coerceAtLeast(0)
-            val lengthToRead = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-                minOf(available.toLong(), dataSpec.length).toInt()
-            } else {
-                available
+                val crossHeaders = HashMap(defaultHeaders).apply {
+                    put("Referer", "$refOrigin/")
+                    put("Origin", refOrigin)
+                    put("Sec-Fetch-Dest", "empty")
+                    put("Sec-Fetch-Mode", "cors")
+                    put("Sec-Fetch-Site", "cross-site")
+                }
+                resp = activeClient.newCall(buildBaseRequest(crossHeaders)).execute()
             }
 
-            inputStream = ByteArrayInputStream(cleanedBytes, startOffset, lengthToRead)
-            bytesRemaining = lengthToRead.toLong()
+            // Intento 3 (si sigue 403/401): Origin del propio servidor del segmento
+            if (!resp.isSuccessful && (resp.code == 403 || resp.code == 401)) {
+                resp.close()
+                val segOrigin = runCatching {
+                    "${dataSpec.uri.scheme}://${dataSpec.uri.host}"
+                }.getOrDefault("https://player.zilla-networks.com")
+
+                val selfHeaders = mapOf(
+                    "Referer" to "$segOrigin/",
+                    "Origin" to segOrigin,
+                    "Accept" to "*/*"
+                )
+                resp = activeClient.newCall(buildBaseRequest(selfHeaders)).execute()
+            }
+
+            // Intento 4 (si sigue 403/401): Petición limpia sin Referer ni Origin
+            if (!resp.isSuccessful && (resp.code == 403 || resp.code == 401)) {
+                resp.close()
+                resp = activeClient.newCall(buildBaseRequest(mapOf("Accept" to "*/*"))).execute()
+            }
+
+            return resp
         }
 
-        opened = true
-        transferStarted(dataSpec)
-        return bytesRemaining
+        var lastException: IOException? = null
+
+        // Hasta 3 intentos por segmento ante hipos temporales de red o errores 5xx/429 del CDN
+        for (attempt in 1..3) {
+            try {
+                val resp = executeSingleAttempt()
+
+                if (!resp.isSuccessful) {
+                    val code = resp.code
+                    resp.close()
+                    if ((code == 429 || code >= 500) && attempt < 3) {
+                        runCatching { Thread.sleep(350L * attempt) }
+                        continue
+                    }
+                    onDiagnosticInfo("HTTP $code en ${urlStr.takeLast(45)}")
+                    throw IOException("HTTP $code al abrir $urlStr")
+                }
+
+                val body = resp.body ?: run {
+                    resp.close()
+                    throw IOException("Body vacío en $urlStr")
+                }
+
+                if (isMp4File) {
+                    response = resp
+                    currentUri = Uri.parse(resp.request.url.toString())
+                    inputStream = body.byteStream()
+                    bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+                        dataSpec.length
+                    } else {
+                        val contentLength = body.contentLength()
+                        if (contentLength != -1L) contentLength else C.LENGTH_UNSET.toLong()
+                    }
+                } else {
+                    val finalUrlStr = resp.request.url.toString()
+                    val rawBytes = try {
+                        body.bytes()
+                    } finally {
+                        body.close()
+                        resp.close()
+                    }
+
+                    if (rawBytes.isEmpty() && attempt < 3) {
+                        runCatching { Thread.sleep(300L * attempt) }
+                        continue
+                    }
+
+                    currentUri = Uri.parse(finalUrlStr)
+                    val cleanedBytes = sanitizeHlsPayload(rawBytes, finalUrlStr)
+                    val startOffset = dataSpec.position.toInt().coerceIn(0, cleanedBytes.size)
+                    val available = (cleanedBytes.size - startOffset).coerceAtLeast(0)
+                    val lengthToRead = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+                        minOf(available.toLong(), dataSpec.length).toInt()
+                    } else {
+                        available
+                    }
+
+                    inputStream = ByteArrayInputStream(cleanedBytes, startOffset, lengthToRead)
+                    bytesRemaining = lengthToRead.toLong()
+                }
+
+                opened = true
+                transferStarted(dataSpec)
+                return bytesRemaining
+            } catch (e: IOException) {
+                lastException = e
+                if (attempt < 3) {
+                    runCatching { Thread.sleep(350L * attempt) }
+                }
+            }
+        }
+
+        throw (lastException ?: IOException("No se pudo abrir $urlStr"))
     }
 
-    /**
-     * Si el archivo es una lista #EXTM3U, asegura que las rutas relativas de los segmentos
-     * (ej. 000.html) se resuelvan bien.
-     * Si el archivo es un segmento de video (000.html, 001.html), elimina cualquier cabecera
-     * falsa antes del primer paquete MPEG-TS (0x47) o caja fMP4.
-     */
     private fun sanitizeHlsPayload(bytes: ByteArray, baseUrl: String): ByteArray {
         if (bytes.isEmpty()) return bytes
 
-        // 1. Verificar si es un manifiesto de texto #EXTM3U
         val headSample = String(bytes, 0, minOf(bytes.size, 256), Charsets.UTF_8).trimStart()
         if (headSample.startsWith("#EXTM3U") || headSample.contains("#EXTINF")) {
             return bytes
         }
 
-        // 2. Si ya empieza con el byte de sincronización MPEG-TS (0x47 cada 188 bytes), está limpio
         if (bytes.size >= 188 * 3 &&
             bytes[0] == 0x47.toByte() &&
             bytes[188] == 0x47.toByte() &&
@@ -265,7 +299,6 @@ private class WakuSegmentSanitizingDataSource(
             return bytes
         }
 
-        // 3. Escanear los primeros 64 KB buscando la secuencia de paquetes MPEG-TS (0x47 cada 188 bytes)
         if (bytes.size >= 188 * 3) {
             val maxScan = minOf(bytes.size - (188 * 3), 65536)
             for (offset in 1 until maxScan) {
@@ -278,7 +311,6 @@ private class WakuSegmentSanitizingDataSource(
             }
         }
 
-        // 4. Verificar si es un segmento fMP4 (ftyp / styp / moof / sidx) con cabecera falsa al inicio
         if (bytes.size >= 32) {
             val maxScanMp4 = minOf(bytes.size - 8, 16384)
             for (offset in 4 until maxScanMp4) {
@@ -349,14 +381,19 @@ fun VideoPlayerScreen(
     val db = remember { FirebaseFirestore.getInstance() }
     val uid = auth.currentUser?.uid
 
+    val playerPrefs = remember {
+        context.getSharedPreferences("waku_player_prefs_v1", Context.MODE_PRIVATE)
+    }
+
     var currentEpisodeNumber by remember { mutableIntStateOf(initialEpisodeNumber) }
     var streamsData by remember { mutableStateOf<EpisodeStreamsData?>(null) }
     var isLoadingServers by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    // Idioma ("SUB" o "DUB") y Servidor seleccionado (0 = HLS por defecto)
+    // Idioma ("SUB" o "DUB") y Servidor seleccionado (0 = HLS por defecto salvo preferencia por anime)
     var selectedLang by remember { mutableStateOf("SUB") }
     var selectedServerIndex by remember { mutableIntStateOf(0) }
+    var preferredServerName by remember { mutableStateOf<String?>(null) }
     var showServerPickerModal by remember { mutableStateOf(false) }
 
     // URL real (.m3u8 / .mp4) y cabeceras para ExoPlayer
@@ -375,9 +412,13 @@ fun VideoPlayerScreen(
     var controlsVisible by remember { mutableStateOf(true) }
     var seekNoticeText by remember { mutableStateOf<String?>(null) }
 
-    // Progreso guardado en Firestore
+    // Control de continuidad y auto-recuperación ante cortes de red a mitad del capítulo
     var savedInitialFraction by remember { mutableFloatStateOf(0f) }
     var hasRestoredPosition by remember { mutableStateOf(false) }
+    var pendingSeekPositionMs by remember { mutableLongStateOf(-1L) }
+    var lastKnownValidPositionMs by remember { mutableLongStateOf(0L) }
+    var lastKnownValidDurationMs by remember { mutableLongStateOf(0L) }
+    var autoRecoveryAttempts by remember { mutableIntStateOf(0) }
     var watchedSet by remember { mutableStateOf<Set<Int>>(emptySet()) }
 
     // 1. Modo Horizontal (Landscape) y Pantalla Inmersiva
@@ -396,20 +437,81 @@ fun VideoPlayerScreen(
         onDispose {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             if (window != null) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 val controller = WindowCompat.getInsetsController(window, window.decorView)
                 controller.show(WindowInsetsCompat.Type.systemBars())
             }
         }
     }
 
-    // 2. Instancia única de ExoPlayer
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            playWhenReady = true
+    // 1B. Mantener la pantalla encendida SOLO mientras el video se está reproduciendo o cargando.
+    // Si el usuario pausa el video o sale del reproductor, permite el apagado normal de pantalla.
+    val shouldKeepScreenOn = (isPlaying || isBuffering || isLoadingServers || isSniffingStream) &&
+            errorMessage == null && serverFailedMessage == null
+
+    DisposableEffect(shouldKeepScreenOn) {
+        val window = context.findActivity()?.window
+        if (shouldKeepScreenOn) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 
-    // 3. Cargar lista de servidores del episodio + progreso previo en Firestore
+    // 2. Instancia única de ExoPlayer
+    val exoPlayer = remember {
+        ExoPlayer.Builder(context)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .build().apply {
+                playWhenReady = true
+            }
+    }
+
+    // Helper: Guarda las preferencias de idioma y servidor para ESTE anime específico
+    fun saveAnimePlayerPreferences(newLang: String, newServerName: String?) {
+        playerPrefs.edit().apply {
+            putString("lang_$slug", newLang)
+            if (!newServerName.isNullOrBlank()) {
+                putString("srv_$slug", newServerName)
+            }
+            apply()
+        }
+        val animeId = streamsData?.animeId ?: 0
+        if (uid != null && animeId > 0) {
+            val updates = mutableMapOf<String, Any>("preferredLang" to newLang)
+            if (!newServerName.isNullOrBlank()) {
+                updates["preferredServer"] = newServerName
+            }
+            db.collection("usuarios").document(uid)
+                .collection("mi_lista").document(animeId.toString())
+                .set(updates, SetOptions.merge())
+        }
+    }
+
+    // Helper: Captura el segundo actual (-1s) antes de cambiar de servidor o de audio
+    fun capturePositionForContinuity() {
+        val currentPos = maxOf(exoPlayer.currentPosition, lastKnownValidPositionMs)
+        if (currentPos > 1500L) {
+            pendingSeekPositionMs = (currentPos - 1000L).coerceAtLeast(0L)
+        }
+    }
+
+    // Helper: Obtiene la posición y duración reales sin riesgo de sobrescribir con 00:00
+    fun getSafeProgressSnapshot(): Pair<Long, Long> {
+        val safePos = when {
+            pendingSeekPositionMs > 0L -> pendingSeekPositionMs
+            exoPlayer.currentPosition > 2000L -> exoPlayer.currentPosition
+            lastKnownValidPositionMs > 2000L -> lastKnownValidPositionMs
+            else -> 0L
+        }
+        val safeDur = if (exoPlayer.duration > 5000L) exoPlayer.duration else lastKnownValidDurationMs
+        return safePos to safeDur
+    }
+
+    // 3. Cargar lista de servidores del episodio + progreso y preferencias previas del anime
     LaunchedEffect(slug, currentEpisodeNumber) {
         isLoadingServers = true
         errorMessage = null
@@ -417,6 +519,10 @@ fun VideoPlayerScreen(
         resolvedStreamUrl = null
         hasRestoredPosition = false
         savedInitialFraction = 0f
+        pendingSeekPositionMs = -1L
+        lastKnownValidPositionMs = 0L
+        lastKnownValidDurationMs = 0L
+        autoRecoveryAttempts = 0
         currentPositionMs = 0L
         durationMs = 0L
         exoPlayer.stop()
@@ -424,33 +530,66 @@ fun VideoPlayerScreen(
 
         val res = WakuRepository.fetchEpisodeStreams(context, slug, currentEpisodeNumber)
         res.onSuccess { data ->
-            streamsData = data
-            if (selectedLang == "DUB" && data.dubServers.isEmpty()) {
-                selectedLang = "SUB"
-            }
-            selectedServerIndex = 0
-            isLoadingServers = false
+            var savedLangPref = playerPrefs.getString("lang_$slug", null)
+            var savedServerPref = playerPrefs.getString("srv_$slug", null)
 
             if (uid != null && data.animeId > 0) {
-                db.collection("usuarios").document(uid)
-                    .collection("mi_lista").document(data.animeId.toString())
-                    .get()
-                    .addOnSuccessListener { snap ->
-                        if (snap != null && snap.exists()) {
-                            val rawWatched = snap.get("watchedEpisodes") as? List<*>
-                            watchedSet = rawWatched?.mapNotNull { (it as? Number)?.toInt() }?.toSet()
-                                ?: emptySet()
+                val snap = withContext(Dispatchers.IO) {
+                    runCatching {
+                        Tasks.await(
+                            db.collection("usuarios").document(uid)
+                                .collection("mi_lista").document(data.animeId.toString())
+                                .get(),
+                            2500,
+                            TimeUnit.MILLISECONDS
+                        )
+                    }.getOrNull()
+                }
 
-                            val savedEp = snap.getLong("episodioActual")?.toInt() ?: -1
-                            val savedProg = (snap.getDouble("progress")?.toFloat() ?: 0f).coerceIn(0f, 1f)
-                            if (savedEp == currentEpisodeNumber && savedProg in 0.05f..0.88f) {
-                                savedInitialFraction = savedProg
-                            } else {
-                                savedInitialFraction = 0f
-                            }
-                        }
+                if (snap != null && snap.exists()) {
+                    val rawWatched = snap.get("watchedEpisodes") as? List<*>
+                    watchedSet = rawWatched?.mapNotNull { (it as? Number)?.toInt() }?.toSet()
+                        ?: emptySet()
+
+                    val savedEp = snap.getLong("episodioActual")?.toInt() ?: -1
+                    val savedProg = (snap.getDouble("progress")?.toFloat() ?: 0f).coerceIn(0f, 1f)
+                    if (savedEp == currentEpisodeNumber && savedProg in 0.03f..0.88f) {
+                        savedInitialFraction = savedProg
                     }
+
+                    val remoteLang = snap.getString("preferredLang")?.trim()
+                    val remoteSrv = snap.getString("preferredServer")?.trim()
+                    if (savedLangPref.isNullOrBlank() && !remoteLang.isNullOrBlank()) {
+                        savedLangPref = remoteLang
+                        playerPrefs.edit().putString("lang_$slug", remoteLang).apply()
+                    }
+                    if (savedServerPref.isNullOrBlank() && !remoteSrv.isNullOrBlank()) {
+                        savedServerPref = remoteSrv
+                        playerPrefs.edit().putString("srv_$slug", remoteSrv).apply()
+                    }
+                }
             }
+
+            // Resolver idioma: respeta la preferencia del anime, y si el anime es solo DUB (ej. Dragon Ball) usa DUB
+            val desiredLang = savedLangPref ?: "SUB"
+            val resolvedLang = when {
+                desiredLang == "DUB" && data.dubServers.isNotEmpty() -> "DUB"
+                desiredLang == "SUB" && data.subServers.isNotEmpty() -> "SUB"
+                data.subServers.isEmpty() && data.dubServers.isNotEmpty() -> "DUB"
+                data.dubServers.isEmpty() && data.subServers.isNotEmpty() -> "SUB"
+                else -> "SUB"
+            }
+
+            val targetPool = if (resolvedLang == "DUB") data.dubServers else data.subServers
+            val matchedServerIndex = if (!savedServerPref.isNullOrBlank()) {
+                targetPool.indexOfFirst { it.name.equals(savedServerPref, ignoreCase = true) }
+            } else -1
+
+            selectedLang = resolvedLang
+            preferredServerName = savedServerPref
+            selectedServerIndex = if (matchedServerIndex >= 0) matchedServerIndex else 0
+            streamsData = data
+            isLoadingServers = false
         }.onFailure { err ->
             errorMessage = err.localizedMessage ?: "No se pudieron obtener los servidores del episodio"
             isLoadingServers = false
@@ -459,21 +598,23 @@ fun VideoPlayerScreen(
 
     val activeServerList = remember(streamsData, selectedLang) {
         val data = streamsData ?: return@remember emptyList()
-        if (selectedLang == "DUB" && data.dubServers.isNotEmpty()) {
-            data.dubServers
-        } else {
-            data.subServers
+        when {
+            selectedLang == "DUB" && data.dubServers.isNotEmpty() -> data.dubServers
+            selectedLang == "SUB" && data.subServers.isNotEmpty() -> data.subServers
+            data.dubServers.isNotEmpty() -> data.dubServers
+            else -> data.subServers
         }
     }
 
     val currentServer = activeServerList.getOrNull(selectedServerIndex) ?: activeServerList.firstOrNull()
 
-    // 4. Extraer el stream cuando cambia el servidor seleccionado
-    LaunchedEffect(currentServer?.embedUrl) {
+    // 4. Extraer el stream cuando cambia el servidor o el idioma seleccionado
+    LaunchedEffect(currentServer?.embedUrl, selectedLang) {
         val embedUrl = currentServer?.embedUrl ?: return@LaunchedEffect
         resolvedStreamUrl = null
         serverFailedMessage = null
         lastDiagnosticText = ""
+        autoRecoveryAttempts = 0
         snifferTargetUrl = null
         isSniffingStream = true
         controlsVisible = true
@@ -495,7 +636,7 @@ fun VideoPlayerScreen(
         }
     }
 
-    // 5. Inyectar el stream en ExoPlayer usando WakuSegmentSanitizingDataSource
+    // 5. Inyectar el stream en ExoPlayer con política de reintento extendida (hasta 6 reintentos por segmento)
     LaunchedEffect(resolvedStreamUrl) {
         val streamUrl = resolvedStreamUrl ?: return@LaunchedEffect
         isBuffering = true
@@ -509,14 +650,16 @@ fun VideoPlayerScreen(
             )
         }
 
+        val resilientLoadPolicy = DefaultLoadErrorHandlingPolicy(6)
         val lowerUrl = streamUrl.lowercase()
         val isMp4 = lowerUrl.contains(".mp4") && !lowerUrl.contains(".m3u8")
 
         val mediaSource = if (isMp4) {
             val mediaItem = MediaItem.fromUri(streamUrl)
-            DefaultMediaSourceFactory(dataSourceFactory).createMediaSource(mediaItem)
+            DefaultMediaSourceFactory(dataSourceFactory)
+                .setLoadErrorHandlingPolicy(resilientLoadPolicy)
+                .createMediaSource(mediaItem)
         } else {
-            // Flags 9 = FLAG_ALLOW_NON_IDR_KEYFRAMES (1) | FLAG_DETECT_ACCESS_UNITS (8)
             val hlsExtractorFactory = DefaultHlsExtractorFactory(9, true)
             val mediaItem = MediaItem.Builder()
                 .setUri(streamUrl)
@@ -524,6 +667,7 @@ fun VideoPlayerScreen(
                 .build()
             HlsMediaSource.Factory(dataSourceFactory)
                 .setExtractorFactory(hlsExtractorFactory)
+                .setLoadErrorHandlingPolicy(resilientLoadPolicy)
                 .setAllowChunklessPreparation(false)
                 .createMediaSource(mediaItem)
         }
@@ -533,7 +677,7 @@ fun VideoPlayerScreen(
         exoPlayer.playWhenReady = true
     }
 
-    // 6. Escuchar estado de ExoPlayer (Sin auto-skip inmediato para no cortar HLS)
+    // 6. Escuchar estado de ExoPlayer, restaurar minuto exacto y auto-recuperarse de micro-cortes
     DisposableEffect(exoPlayer, currentServer) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
@@ -544,17 +688,47 @@ fun VideoPlayerScreen(
                 isBuffering = playbackState == Player.STATE_BUFFERING
                 if (playbackState == Player.STATE_READY) {
                     serverFailedMessage = null
+                    autoRecoveryAttempts = 0
                     durationMs = exoPlayer.duration.coerceAtLeast(0L)
-                    if (!hasRestoredPosition && savedInitialFraction > 0.05f && durationMs > 0L) {
+                    if (durationMs > 5000L) {
+                        lastKnownValidDurationMs = durationMs
+                    }
+
+                    // Prioridad 1: Venimos de un cambio de servidor/audio o auto-recuperación (-1s)
+                    if (pendingSeekPositionMs >= 0L && durationMs > 0L) {
+                        val targetMs = pendingSeekPositionMs.coerceAtMost((durationMs - 1000L).coerceAtLeast(0L))
+                        pendingSeekPositionMs = -1L
+                        hasRestoredPosition = true
+                        exoPlayer.seekTo(targetMs)
+                        currentPositionMs = targetMs
+                        lastKnownValidPositionMs = targetMs
+                        seekNoticeText = "✦ Continuando en ${formatTimeMs(targetMs)}"
+                    }
+                    // Prioridad 2: Primera carga del episodio retomando progreso guardado en Firestore
+                    else if (!hasRestoredPosition && savedInitialFraction > 0.03f && durationMs > 0L) {
                         hasRestoredPosition = true
                         val targetMs = (durationMs * savedInitialFraction).toLong()
                         exoPlayer.seekTo(targetMs)
+                        currentPositionMs = targetMs
+                        lastKnownValidPositionMs = targetMs
                         seekNoticeText = "Reanudando en ${formatTimeMs(targetMs)}"
+                    } else if (!hasRestoredPosition) {
+                        hasRestoredPosition = true
                     }
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                // Si ya estaba reproduciendo (ej. minuto 17) y hubo un hipo del CDN, reconectamos 1 vez en silencio
+                if (autoRecoveryAttempts < 1 && lastKnownValidPositionMs > 3000L) {
+                    autoRecoveryAttempts += 1
+                    capturePositionForContinuity()
+                    isBuffering = true
+                    exoPlayer.prepare()
+                    exoPlayer.play()
+                    return
+                }
+
                 isBuffering = false
                 controlsVisible = true
                 val causeDetail = error.cause?.localizedMessage ?: error.localizedMessage ?: error.errorCodeName
@@ -568,35 +742,45 @@ fun VideoPlayerScreen(
         }
     }
 
-    // Pausar y guardar progreso al minimizar o salir de la pantalla
+    // Pausar y guardar progreso seguro al minimizar o salir de la pantalla
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE) {
                 exoPlayer.pause()
-                streamsData?.let { data ->
-                    savePlaybackProgressToFirestore(
-                        db = db,
-                        uid = uid,
-                        data = data,
-                        currentPosMs = exoPlayer.currentPosition,
-                        totalDurationMs = exoPlayer.duration,
-                        currentWatched = watchedSet
-                    )
+                val (safePos, safeDur) = getSafeProgressSnapshot()
+                if (safePos > 2000L && safeDur > 5000L) {
+                    streamsData?.let { data ->
+                        savePlaybackProgressToFirestore(
+                            db = db,
+                            uid = uid,
+                            data = data,
+                            currentPosMs = safePos,
+                            totalDurationMs = safeDur,
+                            currentWatched = watchedSet,
+                            preferredLang = selectedLang,
+                            preferredServer = currentServer?.name
+                        )
+                    }
                 }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            streamsData?.let { data ->
-                savePlaybackProgressToFirestore(
-                    db = db,
-                    uid = uid,
-                    data = data,
-                    currentPosMs = exoPlayer.currentPosition,
-                    totalDurationMs = exoPlayer.duration,
-                    currentWatched = watchedSet
-                )
+            val (safePos, safeDur) = getSafeProgressSnapshot()
+            if (safePos > 2000L && safeDur > 5000L) {
+                streamsData?.let { data ->
+                    savePlaybackProgressToFirestore(
+                        db = db,
+                        uid = uid,
+                        data = data,
+                        currentPosMs = safePos,
+                        totalDurationMs = safeDur,
+                        currentWatched = watchedSet,
+                        preferredLang = selectedLang,
+                        preferredServer = currentServer?.name
+                    )
+                }
             }
             exoPlayer.stop()
             exoPlayer.release()
@@ -608,11 +792,27 @@ fun VideoPlayerScreen(
         var tick = 0
         while (true) {
             if (resolvedStreamUrl != null) {
-                currentPositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
-                durationMs = exoPlayer.duration.coerceAtLeast(0L)
+                val rawPos = exoPlayer.currentPosition.coerceAtLeast(0L)
+                val rawDur = exoPlayer.duration.coerceAtLeast(0L)
+
+                if (pendingSeekPositionMs < 0L && hasRestoredPosition) {
+                    currentPositionMs = rawPos
+                    if (rawPos > 1500L) {
+                        lastKnownValidPositionMs = rawPos
+                    }
+                }
+                if (rawDur > 5000L) {
+                    durationMs = rawDur
+                    lastKnownValidDurationMs = rawDur
+                }
 
                 tick++
-                if (tick % 10 == 0 && durationMs > 0L && currentPositionMs > 2000L) {
+                if (tick % 10 == 0 &&
+                    pendingSeekPositionMs < 0L &&
+                    hasRestoredPosition &&
+                    durationMs > 5000L &&
+                    currentPositionMs > 2500L
+                ) {
                     streamsData?.let { data ->
                         watchedSet = savePlaybackProgressToFirestore(
                             db = db,
@@ -620,7 +820,9 @@ fun VideoPlayerScreen(
                             data = data,
                             currentPosMs = currentPositionMs,
                             totalDurationMs = durationMs,
-                            currentWatched = watchedSet
+                            currentWatched = watchedSet,
+                            preferredLang = selectedLang,
+                            preferredServer = currentServer?.name
                         )
                     }
                 }
@@ -647,15 +849,20 @@ fun VideoPlayerScreen(
     }
 
     BackHandler {
-        streamsData?.let { data ->
-            savePlaybackProgressToFirestore(
-                db = db,
-                uid = uid,
-                data = data,
-                currentPosMs = exoPlayer.currentPosition,
-                totalDurationMs = exoPlayer.duration,
-                currentWatched = watchedSet
-            )
+        val (safePos, safeDur) = getSafeProgressSnapshot()
+        if (safePos > 2000L && safeDur > 5000L) {
+            streamsData?.let { data ->
+                savePlaybackProgressToFirestore(
+                    db = db,
+                    uid = uid,
+                    data = data,
+                    currentPosMs = safePos,
+                    totalDurationMs = safeDur,
+                    currentWatched = watchedSet,
+                    preferredLang = selectedLang,
+                    preferredServer = currentServer?.name
+                )
+            }
         }
         exoPlayer.stop()
         onBackClick()
@@ -697,11 +904,15 @@ fun VideoPlayerScreen(
                             if (offset.x < screenW * 0.4f) {
                                 val newPos = (exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)
                                 exoPlayer.seekTo(newPos)
+                                currentPositionMs = newPos
+                                lastKnownValidPositionMs = newPos
                                 seekNoticeText = "⏪ -10s"
                             } else if (offset.x > screenW * 0.6f) {
                                 val maxDur = exoPlayer.duration.coerceAtLeast(0L)
                                 val newPos = (exoPlayer.currentPosition + 10_000L).coerceAtMost(maxDur)
                                 exoPlayer.seekTo(newPos)
+                                currentPositionMs = newPos
+                                lastKnownValidPositionMs = newPos
                                 seekNoticeText = "⏩ +10s"
                             } else {
                                 controlsVisible = !controlsVisible
@@ -712,7 +923,7 @@ fun VideoPlayerScreen(
             factory = { ctx ->
                 PlayerView(ctx).apply {
                     useController = false
-                    keepScreenOn = true
+                    keepScreenOn = shouldKeepScreenOn
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     player = exoPlayer
                     layoutParams = ViewGroup.LayoutParams(
@@ -722,6 +933,7 @@ fun VideoPlayerScreen(
                 }
             },
             update = { view ->
+                view.keepScreenOn = shouldKeepScreenOn
                 if (view.player != exoPlayer) {
                     view.player = exoPlayer
                 }
@@ -784,6 +996,7 @@ fun VideoPlayerScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(
                             onClick = {
+                                capturePositionForContinuity()
                                 serverFailedMessage = null
                                 exoPlayer.prepare()
                                 exoPlayer.play()
@@ -881,6 +1094,21 @@ fun VideoPlayerScreen(
                     ) {
                         IconButton(
                             onClick = {
+                                val (safePos, safeDur) = getSafeProgressSnapshot()
+                                if (safePos > 2000L && safeDur > 5000L) {
+                                    streamsData?.let { data ->
+                                        savePlaybackProgressToFirestore(
+                                            db = db,
+                                            uid = uid,
+                                            data = data,
+                                            currentPosMs = safePos,
+                                            totalDurationMs = safeDur,
+                                            currentWatched = watchedSet,
+                                            preferredLang = selectedLang,
+                                            preferredServer = currentServer?.name
+                                        )
+                                    }
+                                }
                                 exoPlayer.stop()
                                 onBackClick()
                             },
@@ -926,8 +1154,11 @@ fun VideoPlayerScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        val hasSub = streamsData?.subServers?.isNotEmpty() == true
                         val hasDub = streamsData?.dubServers?.isNotEmpty() == true
-                        if (hasDub) {
+                        val canToggleLang = hasSub && hasDub
+
+                        if (hasDub || hasSub) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
@@ -935,8 +1166,34 @@ fun VideoPlayerScreen(
                                     .background(Color(0xFF211B18).copy(alpha = 0.90f))
                                     .border(1.dp, WakuGold.copy(alpha = 0.45f), CircleShape)
                                     .clickable {
-                                        selectedLang = if (selectedLang == "SUB") "DUB" else "SUB"
-                                        selectedServerIndex = 0
+                                        if (canToggleLang) {
+                                            capturePositionForContinuity()
+                                            val newLang = if (selectedLang == "SUB") "DUB" else "SUB"
+                                            val targetPool = if (newLang == "DUB") {
+                                                streamsData?.dubServers.orEmpty()
+                                            } else {
+                                                streamsData?.subServers.orEmpty()
+                                            }
+                                            val preferredName = preferredServerName ?: currentServer?.name
+                                            val matchedIdx = if (!preferredName.isNullOrBlank()) {
+                                                targetPool.indexOfFirst {
+                                                    it.name.equals(preferredName, ignoreCase = true)
+                                                }
+                                            } else -1
+
+                                            selectedLang = newLang
+                                            selectedServerIndex = if (matchedIdx >= 0) matchedIdx else 0
+                                            saveAnimePlayerPreferences(
+                                                newLang = newLang,
+                                                newServerName = targetPool.getOrNull(selectedServerIndex)?.name
+                                            )
+                                        } else {
+                                            seekNoticeText = if (hasDub) {
+                                                "Solo disponible en Audio Latino"
+                                            } else {
+                                                "Solo disponible en Subtitulado (JP)"
+                                            }
+                                        }
                                     }
                                     .padding(horizontal = 12.dp, vertical = 7.dp)
                             ) {
@@ -995,6 +1252,8 @@ fun VideoPlayerScreen(
                             onClick = {
                                 val target = (exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)
                                 exoPlayer.seekTo(target)
+                                currentPositionMs = target
+                                lastKnownValidPositionMs = target
                                 seekNoticeText = "⏪ -10s"
                             },
                             modifier = Modifier
@@ -1039,6 +1298,8 @@ fun VideoPlayerScreen(
                                 val maxDur = exoPlayer.duration.coerceAtLeast(0L)
                                 val target = (exoPlayer.currentPosition + 10_000L).coerceAtMost(maxDur)
                                 exoPlayer.seekTo(target)
+                                currentPositionMs = target
+                                lastKnownValidPositionMs = target
                                 seekNoticeText = "⏩ +10s"
                             },
                             modifier = Modifier
@@ -1092,6 +1353,8 @@ fun VideoPlayerScreen(
                                             val maxDur = exoPlayer.duration.coerceAtLeast(0L)
                                             val target = (exoPlayer.currentPosition + 85_000L).coerceAtMost(maxDur)
                                             exoPlayer.seekTo(target)
+                                            currentPositionMs = target
+                                            lastKnownValidPositionMs = target
                                             seekNoticeText = "✦ +85s Intro"
                                         }
                                         .padding(horizontal = 14.dp, vertical = 6.dp)
@@ -1120,7 +1383,9 @@ fun VideoPlayerScreen(
                                                     data = data,
                                                     currentPosMs = durationMs.coerceAtLeast(10_000L),
                                                     totalDurationMs = durationMs.coerceAtLeast(10_000L),
-                                                    currentWatched = watchedSet
+                                                    currentWatched = watchedSet,
+                                                    preferredLang = selectedLang,
+                                                    preferredServer = currentServer?.name
                                                 )
                                             }
                                             currentEpisodeNumber += 1
@@ -1157,6 +1422,7 @@ fun VideoPlayerScreen(
                             if (durationMs > 0L) {
                                 val newPos = (newFraction * durationMs).toLong()
                                 currentPositionMs = newPos
+                                lastKnownValidPositionMs = newPos
                                 exoPlayer.seekTo(newPos)
                             }
                         },
@@ -1202,7 +1468,7 @@ fun VideoPlayerScreen(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "HLS es la opción recomendada por defecto",
+                        text = "Tu elección se recordará para los capítulos de este anime",
                         color = Color(0xFFE4BEB7).copy(alpha = 0.75f),
                         fontSize = 12.sp
                     )
@@ -1222,7 +1488,15 @@ fun VideoPlayerScreen(
                                         shape = CircleShape
                                     )
                                     .clickable {
-                                        selectedServerIndex = index
+                                        if (index != selectedServerIndex || serverFailedMessage != null) {
+                                            capturePositionForContinuity()
+                                            selectedServerIndex = index
+                                            preferredServerName = srv.name
+                                            saveAnimePlayerPreferences(
+                                                newLang = selectedLang,
+                                                newServerName = srv.name
+                                            )
+                                        }
                                         showServerPickerModal = false
                                     }
                                     .padding(horizontal = 16.dp, vertical = 9.dp)
@@ -1276,13 +1550,11 @@ private fun SilentStreamSnifferWebView(
         }
     }
 
-    // Enviar únicamente toque nativo Android (isTrusted = true) en las coordenadas del botón Play
     LaunchedEffect(embedUrl) {
         delay(1800)
         repeat(6) {
             if (hasCaptured.get()) return@LaunchedEffect
             webViewRef?.let { wv ->
-                // Silenciar audio y obtener coordenadas reales del botón de Play sin disparar .click() sintético
                 wv.evaluateJavascript(
                     """
                     (function() {
@@ -1458,7 +1730,9 @@ private fun savePlaybackProgressToFirestore(
     data: EpisodeStreamsData,
     currentPosMs: Long,
     totalDurationMs: Long,
-    currentWatched: Set<Int>
+    currentWatched: Set<Int>,
+    preferredLang: String? = null,
+    preferredServer: String? = null
 ): Set<Int> {
     if (uid == null || data.animeId <= 0 || totalDurationMs <= 5_000L) return currentWatched
 
@@ -1487,6 +1761,13 @@ private fun savePlaybackProgressToFirestore(
         val thumbEp = if (isEpisodeCompleted && data.hasNextEpisode) data.episodeNumber + 1 else data.episodeNumber
         put("imageUrl", "https://cdn.animeav1.com/screenshots/${data.animeId}/$thumbEp.jpg")
         put("updatedAt", System.currentTimeMillis())
+
+        if (!preferredLang.isNullOrBlank()) {
+            put("preferredLang", preferredLang)
+        }
+        if (!preferredServer.isNullOrBlank()) {
+            put("preferredServer", preferredServer)
+        }
 
         if (allSeriesCompleted) {
             put("estado", "FINALIZADO")
