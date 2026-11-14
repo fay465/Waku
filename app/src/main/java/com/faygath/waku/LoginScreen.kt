@@ -74,6 +74,17 @@ fun getUniqueDeviceId(context: android.content.Context): String {
     ) ?: "unknown_device"
 }
 
+fun getCurrentMonthYearSpanish(): String {
+    val monthsEs = arrayOf(
+        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+    )
+    val calendar = java.util.Calendar.getInstance()
+    val monthName = monthsEs[calendar.get(java.util.Calendar.MONTH)]
+    val year = calendar.get(java.util.Calendar.YEAR)
+    return "$monthName $year"
+}
+
 private fun verifyOrBindDeviceOnLogin(
     context: android.content.Context,
     db: com.google.firebase.firestore.FirebaseFirestore,
@@ -81,7 +92,8 @@ private fun verifyOrBindDeviceOnLogin(
     onSuccess: () -> Unit,
     onError: (String) -> Unit
 ) {
-    val uid = auth.currentUser?.uid
+    val currentUser = auth.currentUser
+    val uid = currentUser?.uid
     if (uid == null) {
         onError("No se pudo verificar la sesión")
         return
@@ -99,10 +111,8 @@ private fun verifyOrBindDeviceOnLogin(
                 return@addOnSuccessListener
             }
 
-            // Límite por defecto: 2 dispositivos (o el número que pongas en el campo "maxDevices" en Firestore)
             val maxAllowed = doc.getLong("maxDevices")?.toInt()?.coerceAtLeast(1) ?: DEFAULT_MAX_DEVICES
 
-            // Leer lista actual de IDs y modelos (con compatibilidad por si ya existía boundDeviceId antiguo)
             val rawIds = (doc.get("boundDeviceIds") as? List<*>)
                 ?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
                 .orEmpty()
@@ -125,40 +135,56 @@ private fun verifyOrBindDeviceOnLogin(
             }
 
             val existingIndex = boundIds.indexOf(currentDeviceId)
+            val canBindNewDevice = boundIds.size < maxAllowed || !STRICT_HARDWARE_LOCK
 
-            if (existingIndex != -1) {
-                // Caso 1: Este dispositivo (celular o tablet) ya es uno de los 2 autorizados
-                if (existingIndex < boundNames.size) {
-                    boundNames[existingIndex] = currentDeviceModel
+            if (existingIndex != -1 || canBindNewDevice) {
+                if (existingIndex != -1) {
+                    if (existingIndex < boundNames.size) {
+                        boundNames[existingIndex] = currentDeviceModel
+                    } else {
+                        boundNames.add(currentDeviceModel)
+                    }
                 } else {
+                    boundIds.add(currentDeviceId)
                     boundNames.add(currentDeviceModel)
                 }
 
-                val updateData = mapOf(
+                val now = System.currentTimeMillis()
+                val authEmail = currentUser.email?.trim().orEmpty()
+                val existingEmail = doc.getString("email")?.trim().orEmpty()
+                val existingUsername = doc.getString("username")?.trim().orEmpty()
+                val existingMemberSince = doc.getString("memberSince")?.trim().orEmpty()
+                val existingAvatar = doc.getString("avatarUrl")?.trim().orEmpty()
+
+                val defaultUsername = currentUser.displayName?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: authEmail.substringBefore("@").replaceFirstChar { it.uppercase() }.ifBlank { "Usuario" }
+
+                val updateData = mutableMapOf<String, Any>(
                     "boundDeviceIds" to boundIds,
                     "boundDeviceNames" to boundNames,
-                    "lastLoginAt" to System.currentTimeMillis()
+                    "lastLoginAt" to now
                 )
+
+                if (existingEmail.isEmpty() && authEmail.isNotEmpty()) {
+                    updateData["email"] = authEmail
+                }
+                if (existingUsername.isEmpty()) {
+                    updateData["username"] = defaultUsername
+                }
+                if (existingMemberSince.isEmpty()) {
+                    updateData["memberSince"] = getCurrentMonthYearSpanish()
+                }
+                if (existingAvatar.isEmpty()) {
+                    updateData["avatarUrl"] = "https://s4.anilist.co/file/anilistcdn/character/large/b138101-768222I9331P.png"
+                }
+                if (!doc.contains("updatedAt")) {
+                    updateData["updatedAt"] = now
+                }
+
                 userRef.set(updateData, com.google.firebase.firestore.SetOptions.merge())
                     .addOnSuccessListener { onSuccess() }
                     .addOnFailureListener { onSuccess() }
-
-            } else if (boundIds.size < maxAllowed || !STRICT_HARDWARE_LOCK) {
-                // Caso 2: Aún tiene cupo libre (ej. tenía 0/2 o 1/2 dispositivos) -> registramos este nuevo
-                boundIds.add(currentDeviceId)
-                boundNames.add(currentDeviceModel)
-
-                val updateData = mapOf(
-                    "boundDeviceIds" to boundIds,
-                    "boundDeviceNames" to boundNames,
-                    "lastLoginAt" to System.currentTimeMillis()
-                )
-                userRef.set(updateData, com.google.firebase.firestore.SetOptions.merge())
-                    .addOnSuccessListener { onSuccess() }
-                    .addOnFailureListener { onSuccess() }
-
             } else {
-                // Caso 3: Ya ocupó sus 2 cupos e intenta entrar un 3er dispositivo
                 auth.signOut()
                 val registeredDevicesText = if (boundNames.isNotEmpty()) {
                     boundNames.joinToString(" y ")

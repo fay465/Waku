@@ -49,11 +49,14 @@ class MainActivity : ComponentActivity() {
                 val startRoute = if (FirebaseAuth.getInstance().currentUser != null) "home" else "login"
 
                 // Vigilante en tiempo real: verifica que este dispositivo esté dentro de los 2 autorizados
+                // Vigilante en tiempo real: verifica los 2 dispositivos autorizados y completa datos faltantes
                 androidx.compose.runtime.DisposableEffect(Unit) {
                     val auth = FirebaseAuth.getInstance()
                     val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
                     val myDeviceId = getUniqueDeviceId(this@MainActivity)
+                    val myDeviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
                     var firestoreListener: com.google.firebase.firestore.ListenerRegistration? = null
+                    var hasAutoHealedProfile = false
 
                     val authListener = FirebaseAuth.AuthStateListener { firebaseAuth ->
                         firestoreListener?.remove()
@@ -62,6 +65,10 @@ class MainActivity : ComponentActivity() {
                             firestoreListener = db.collection("usuarios").document(user.uid)
                                 .addSnapshotListener { snap, _ ->
                                     if (snap != null && snap.exists()) {
+                                        // Si sigue en la pantalla de Login, dejamos que LoginScreen registre el 2.º dispositivo
+                                        val currentRoute = navController.currentDestination?.route
+                                        if (currentRoute == "login") return@addSnapshotListener
+
                                         val isBlocked = snap.getBoolean("bloqueado") == true
 
                                         val boundIds = (snap.get("boundDeviceIds") as? List<*>)
@@ -75,7 +82,6 @@ class MainActivity : ComponentActivity() {
                                             else -> emptyList()
                                         }
 
-                                        // Si la lista existe y este dispositivo no está en ella (o la cuenta fue bloqueada), cerramos sesión
                                         if (isBlocked || (effectiveAllowedIds.isNotEmpty() && myDeviceId !in effectiveAllowedIds)) {
                                             firebaseAuth.signOut()
                                             android.widget.Toast.makeText(
@@ -86,6 +92,40 @@ class MainActivity : ComponentActivity() {
                                             ).show()
                                             navController.navigate("login") {
                                                 popUpTo(0) { inclusive = true }
+                                            }
+                                            return@addSnapshotListener
+                                        }
+
+                                        // Autorreparar campos faltantes si el usuario ya tenía sesión abierta de una versión anterior
+                                        if (!hasAutoHealedProfile) {
+                                            hasAutoHealedProfile = true
+                                            val missingFields = mutableMapOf<String, Any>()
+                                            val authEmail = user.email?.trim().orEmpty()
+
+                                            if (snap.getString("email").isNullOrBlank() && authEmail.isNotEmpty()) {
+                                                missingFields["email"] = authEmail
+                                            }
+                                            if (snap.getString("username").isNullOrBlank()) {
+                                                val fallbackName = user.displayName?.trim()?.takeIf { it.isNotEmpty() }
+                                                    ?: authEmail.substringBefore("@").replaceFirstChar { it.uppercase() }.ifBlank { "Usuario" }
+                                                missingFields["username"] = fallbackName
+                                            }
+                                            if (snap.getString("memberSince").isNullOrBlank()) {
+                                                missingFields["memberSince"] = getCurrentMonthYearSpanish()
+                                            }
+                                            if (snap.getString("avatarUrl").isNullOrBlank()) {
+                                                missingFields["avatarUrl"] = "https://s4.anilist.co/file/anilistcdn/character/large/b138101-768222I9331P.png"
+                                            }
+                                            if (effectiveAllowedIds.isEmpty()) {
+                                                missingFields["boundDeviceIds"] = listOf(myDeviceId)
+                                                missingFields["boundDeviceNames"] = listOf(myDeviceModel)
+                                            }
+                                            if (missingFields.isNotEmpty()) {
+                                                missingFields["updatedAt"] = System.currentTimeMillis()
+                                                snap.reference.set(
+                                                    missingFields,
+                                                    com.google.firebase.firestore.SetOptions.merge()
+                                                )
                                             }
                                         }
                                     }
@@ -127,6 +167,8 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+
+                WakuAutoUpdateChecker()
 
                 NavHost(
                     navController = navController,

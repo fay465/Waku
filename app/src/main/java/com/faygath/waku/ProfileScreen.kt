@@ -89,17 +89,20 @@ fun ProfileScreen(
 
     val userEmail = currentUser?.email ?: "usuario@waku.app"
 
-    val memberSinceText = remember(currentUser) {
+    var memberSinceRaw by remember {
         val creationTs = currentUser?.metadata?.creationTimestamp ?: 0L
-        if (creationTs > 0L) {
+        val initialMonthYear = if (creationTs > 0L) {
             val zdt = Instant.ofEpochMilli(creationTs).atZone(ZoneId.systemDefault())
             val monthEs = zdt.month.getDisplayName(JavaTextStyle.FULL, Locale("es", "ES"))
                 .replaceFirstChar { it.uppercase() }
-            "Miembro desde $monthEs ${zdt.year}"
+            "$monthEs ${zdt.year}"
         } else {
-            "Miembro desde Octubre 2023"
+            getCurrentMonthYearSpanish()
         }
+        mutableStateOf(initialMonthYear)
     }
+
+    val memberSinceText = "Miembro desde $memberSinceRaw"
 
     var selectedAvatarUrl by remember { mutableStateOf(DEFAULT_ANILIST_AVATAR) }
     var displayedUsername by remember {
@@ -148,10 +151,11 @@ fun ProfileScreen(
         label = "avatarPop"
     )
 
-    // Cargar datos actuales del usuario desde Firestore
+    // Cargar datos actuales del usuario desde Firestore y completar campos faltantes automáticamente
     LaunchedEffect(uid) {
         if (uid != null) {
-            db.collection("usuarios").document(uid).get()
+            val userRef = db.collection("usuarios").document(uid)
+            userRef.get()
                 .addOnSuccessListener { doc ->
                     if (doc != null && doc.exists()) {
                         doc.getString("avatarUrl")?.takeIf { it.isNotBlank() }?.let {
@@ -164,15 +168,34 @@ fun ProfileScreen(
                             displayedUsername = savedName
                             usernameInput = savedName
                         }
+                        val savedMemberSince = doc.getString("memberSince")?.trim()
+                        if (!savedMemberSince.isNullOrBlank()) {
+                            memberSinceRaw = savedMemberSince
+                        }
+
+                        // Si al documento le faltaba email, username o memberSince (como le pasó a tu amigo), lo repara al instante
+                        val missingFixes = mutableMapOf<String, Any>()
+                        if (doc.getString("email").isNullOrBlank() && userEmail.isNotBlank()) {
+                            missingFixes["email"] = userEmail
+                        }
+                        if (savedName.isNullOrBlank()) {
+                            missingFixes["username"] = displayedUsername
+                        }
+                        if (savedMemberSince.isNullOrBlank()) {
+                            missingFixes["memberSince"] = memberSinceRaw
+                        }
+                        if (missingFixes.isNotEmpty()) {
+                            missingFixes["updatedAt"] = System.currentTimeMillis()
+                            userRef.set(missingFixes, SetOptions.merge())
+                        }
                     }
                 }
         }
     }
 
+    // Validación amigable: mínimo 6 caracteres (estándar de Firebase Auth)
     val hasValidNewPassword = remember(newPassword) {
-        newPassword.length >= 8 &&
-                newPassword.any { it.isDigit() } &&
-                newPassword.any { !it.isLetterOrDigit() }
+        newPassword.length >= 6
     }
 
     Scaffold(
@@ -551,7 +574,7 @@ fun ProfileScreen(
                         modifier = Modifier.size(14.dp)
                     )
                     Text(
-                        text = "Debe incluir al menos un número y símbolo especial",
+                        text = "La nueva contraseña debe tener al menos 6 caracteres",
                         color = Color(0xFFE4BEB7).copy(alpha = 0.72f),
                         fontSize = 12.sp
                     )
@@ -570,35 +593,15 @@ fun ProfileScreen(
                             return@Button
                         }
 
-                        val wantsPasswordChange = currentPassword.isNotBlank() ||
-                                newPassword.isNotBlank() ||
-                                confirmPassword.isNotBlank()
-
-                        if (wantsPasswordChange) {
-                            if (currentPassword.isBlank()) {
-                                isErrorNotice = true
-                                noticeMessage = "Ingresa tu contraseña actual para confirmar el cambio"
-                                return@Button
-                            }
-                            if (!hasValidNewPassword) {
-                                isErrorNotice = true
-                                noticeMessage = "La nueva contraseña requiere 8+ caracteres, un número y un símbolo"
-                                return@Button
-                            }
-                            if (newPassword != confirmPassword) {
-                                isErrorNotice = true
-                                noticeMessage = "La nueva contraseña y su confirmación no coinciden"
-                                return@Button
-                            }
-                        }
-
                         isSaving = true
 
+                        // 1. SIEMPRE guardamos primero los datos del perfil en Firestore y Auth
                         if (uid != null) {
                             val profileData = mapOf(
                                 "username" to cleanName,
                                 "avatarUrl" to selectedAvatarUrl,
                                 "email" to userEmail,
+                                "memberSince" to memberSinceRaw,
                                 "updatedAt" to System.currentTimeMillis()
                             )
                             db.collection("usuarios").document(uid)
@@ -611,30 +614,58 @@ fun ProfileScreen(
                         currentUser?.updateProfile(profileUpdates)
                         displayedUsername = cleanName
 
-                        if (wantsPasswordChange && currentUser != null && currentUser.email != null) {
-                            val credential = EmailAuthProvider.getCredential(currentUser.email!!, currentPassword)
-                            currentUser.reauthenticate(credential)
-                                .addOnSuccessListener {
-                                    currentUser.updatePassword(newPassword)
-                                        .addOnSuccessListener {
-                                            isSaving = false
-                                            currentPassword = ""
-                                            newPassword = ""
-                                            confirmPassword = ""
-                                            isErrorNotice = false
-                                            noticeMessage = "Perfil y contraseña actualizados con éxito"
-                                        }
-                                        .addOnFailureListener { err ->
-                                            isSaving = false
-                                            isErrorNotice = true
-                                            noticeMessage = err.localizedMessage ?: "Error al actualizar la contraseña"
-                                        }
-                                }
-                                .addOnFailureListener {
-                                    isSaving = false
-                                    isErrorNotice = true
-                                    noticeMessage = "La contraseña actual ingresada es incorrecta"
-                                }
+                        // 2. Si además llenó algún campo de contraseña, validamos y actualizamos la clave
+                        val wantsPasswordChange = currentPassword.isNotBlank() ||
+                                newPassword.isNotBlank() ||
+                                confirmPassword.isNotBlank()
+
+                        if (wantsPasswordChange) {
+                            if (currentPassword.isBlank()) {
+                                isSaving = false
+                                isErrorNotice = true
+                                noticeMessage = "Nombre guardado. Para cambiar la clave, ingresa tu contraseña actual."
+                                return@Button
+                            }
+                            if (!hasValidNewPassword) {
+                                isSaving = false
+                                isErrorNotice = true
+                                noticeMessage = "Nombre guardado. La nueva contraseña requiere mínimo 6 caracteres."
+                                return@Button
+                            }
+                            if (newPassword != confirmPassword) {
+                                isSaving = false
+                                isErrorNotice = true
+                                noticeMessage = "Nombre guardado. La nueva contraseña y su confirmación no coinciden."
+                                return@Button
+                            }
+
+                            if (currentUser != null && currentUser.email != null) {
+                                val credential = EmailAuthProvider.getCredential(currentUser.email!!, currentPassword)
+                                currentUser.reauthenticate(credential)
+                                    .addOnSuccessListener {
+                                        currentUser.updatePassword(newPassword)
+                                            .addOnSuccessListener {
+                                                isSaving = false
+                                                currentPassword = ""
+                                                newPassword = ""
+                                                confirmPassword = ""
+                                                isErrorNotice = false
+                                                noticeMessage = "Perfil y contraseña actualizados con éxito"
+                                            }
+                                            .addOnFailureListener { err ->
+                                                isSaving = false
+                                                isErrorNotice = true
+                                                noticeMessage = err.localizedMessage ?: "Error al actualizar la contraseña"
+                                            }
+                                    }
+                                    .addOnFailureListener {
+                                        isSaving = false
+                                        isErrorNotice = true
+                                        noticeMessage = "Nombre guardado, pero la contraseña actual ingresada es incorrecta"
+                                    }
+                            } else {
+                                isSaving = false
+                            }
                         } else {
                             isSaving = false
                             isErrorNotice = false
@@ -777,7 +808,16 @@ fun ProfileScreen(
                         showAvatarPickerSheet = false
                         if (uid != null) {
                             db.collection("usuarios").document(uid)
-                                .set(mapOf("avatarUrl" to charItem.imageUrl), SetOptions.merge())
+                                .set(
+                                    mapOf(
+                                        "avatarUrl" to charItem.imageUrl,
+                                        "username" to displayedUsername,
+                                        "email" to userEmail,
+                                        "memberSince" to memberSinceRaw,
+                                        "updatedAt" to System.currentTimeMillis()
+                                    ),
+                                    SetOptions.merge()
+                                )
                         }
                         isErrorNotice = false
                         noticeMessage = "Avatar de ${charItem.name} aplicado"
