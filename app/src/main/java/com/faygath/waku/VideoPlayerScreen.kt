@@ -273,6 +273,9 @@ private class WakuSegmentSanitizingDataSource(
                 transferStarted(dataSpec)
                 return bytesRemaining
             } catch (e: IOException) {
+                if (e is java.io.InterruptedIOException || Thread.currentThread().isInterrupted) {
+                    throw e
+                }
                 lastException = e
                 if (attempt < 3) {
                     runCatching { Thread.sleep(350L * attempt) }
@@ -464,7 +467,6 @@ fun VideoPlayerScreen(
     // 2. Instancia única de ExoPlayer
     val exoPlayer = remember {
         ExoPlayer.Builder(context)
-            .setWakeMode(C.WAKE_MODE_NETWORK)
             .build().apply {
                 playWhenReady = true
             }
