@@ -180,6 +180,7 @@ data class EpisodeStreamsData(
     val episodeNumber: Int,
     val episodeTitle: String,
     val totalEpisodes: Int,
+    val isAiring: Boolean = false,
     val hasNextEpisode: Boolean,
     val subServers: List<EpisodeStreamServer>,
     val dubServers: List<EpisodeStreamServer>
@@ -243,7 +244,8 @@ object WakuRepository {
         val year: String?,
         val startDateKey: Int?,
         val score: String?,
-        val formatCategory: String?
+        val formatCategory: String?,
+        val totalEpisodes: Int? = null
     )
 
     private data class ParsedMediaNode(
@@ -670,6 +672,17 @@ object WakuRepository {
                 val sortedEpisodes = parsedEpisodes.sortedBy { it.number }
                 val seasonTabs = resolveFullFranchiseTabs(slug)
 
+                val realTotalEpisodes = if (isAiring) {
+                    // En emisión: solo usamos el total oficial de AniList si está confirmado; si no, 0 ("?")
+                    aniListMeta?.totalEpisodes?.takeIf { it >= sortedEpisodes.size } ?: 0
+                } else {
+                    listOfNotNull(
+                        aniListMeta?.totalEpisodes,
+                        aniZip?.safeInt("episodeCount"),
+                        sortedEpisodes.size
+                    ).maxOrNull() ?: sortedEpisodes.size
+                }
+
                 AnimeDetailData(
                     animeId = animeId,
                     slug = slug,
@@ -678,7 +691,7 @@ object WakuRepository {
                     scoreText = scoreText,
                     yearText = yearText,
                     isAiring = isAiring,
-                    totalEpisodes = sortedEpisodes.size,
+                    totalEpisodes = realTotalEpisodes,
                     genres = if (genres.isNotEmpty()) genres else listOf("Anime"),
                     synopsis = synopsis,
                     seasonTabs = seasonTabs,
@@ -1174,7 +1187,7 @@ object WakuRepository {
             }
 
             val queryJson =
-                """{"query":"{ $queryField { idMal format status seasonYear startDate { year month day } averageScore coverImage { extraLarge } } }"}"""
+                """{"query":"{ $queryField { idMal episodes format status seasonYear startDate { year month day } averageScore coverImage { extraLarge } } }"}"""
             val body = queryJson.toRequestBody("application/json; charset=utf-8".toMediaType())
             val req = Request.Builder()
                 .url("https://graphql.anilist.co")
@@ -1218,6 +1231,7 @@ object WakuRepository {
                 } else null
 
                 val poster = media.safeObj("coverImage")?.safeString("extraLarge")
+                val totalEps = media.safeInt("episodes")?.takeIf { it > 0 }
 
                 AniListMeta(
                     malId = foundMal,
@@ -1226,7 +1240,8 @@ object WakuRepository {
                     year = seasonYear?.toString(),
                     startDateKey = startDateKey,
                     score = formattedScore,
-                    formatCategory = formatCat
+                    formatCategory = formatCat,
+                    totalEpisodes = totalEps
                 ).also { meta ->
                     aniListMetaCache[cacheKey] = meta
                     if (foundMal != null) aniListMetaCache["mal_$foundMal"] = meta
@@ -2541,6 +2556,7 @@ object WakuRepository {
                 episodeNumber = episodeNumber,
                 episodeTitle = epItem?.title ?: "Episodio $episodeNumber",
                 totalEpisodes = totalEps,
+                isAiring = detail?.isAiring ?: false,
                 hasNextEpisode = hasNext,
                 subServers = sortServersForPlayer(subServers),
                 dubServers = sortServersForPlayer(dubServers)

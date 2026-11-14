@@ -180,7 +180,8 @@ fun MyListScreen(
                     isLoading = false
 
                     // Enriquecer en segundo plano cualquier entrada a la que le falten metadatos (totalEpisodes o género)
-                    parsed.filter { it.totalEpisodes == 0 || it.primaryGenre == "Anime" }.forEach { incomplete ->
+                    // Enriquecer en segundo plano solo si falta el género o si es un anime finalizado sin totalEpisodes
+                    parsed.filter { (!it.isAiring && it.totalEpisodes == 0) || it.primaryGenre == "Anime" }.forEach { incomplete ->
                         if (incomplete.slug.isNotBlank() && enrichedSessionIds.add(incomplete.docId)) {
                             coroutineScope.launch {
                                 val dummyCatalogItem = CatalogAnimeItem(
@@ -200,12 +201,14 @@ fun MyListScreen(
                                 val extractedEps = Regex("""(\d+)\s*Eps""").find(enriched.topLeftBadge)
                                     ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 12
 
-                                val updates = mapOf(
+                                val updates = mutableMapOf<String, Any>(
                                     "posterUrl" to enriched.posterUrl,
-                                    "totalEpisodes" to extractedEps,
                                     "isAiring" to enriched.isAiring,
                                     "primaryGenre" to enriched.primaryGenre
                                 )
+                                if (!enriched.isAiring && incomplete.totalEpisodes == 0) {
+                                    updates["totalEpisodes"] = extractedEps
+                                }
                                 db.collection("usuarios").document(uid)
                                     .collection("mi_lista").document(incomplete.docId)
                                     .set(updates, SetOptions.merge())
@@ -1165,10 +1168,10 @@ private fun HistorialTabView(
     ) {
         items(items, key = { it.docId }) { item ->
             var showDeleteMenu by remember { mutableStateOf(false) }
-            val totalEps = if (item.totalEpisodes > 0) item.totalEpisodes else 12
+            val totalEpsLabel = if (item.totalEpisodes > 0) item.totalEpisodes.toString() else "?"
             val watchedEps = when (item.status) {
-                "FINALIZADO" -> totalEps
-                "VIENDO", "DESCARTADO" -> item.currentEpisode.coerceAtMost(totalEps)
+                "FINALIZADO" -> if (item.totalEpisodes > 0) item.totalEpisodes else item.currentEpisode
+                "VIENDO", "DESCARTADO" -> item.currentEpisode
                 else -> item.watchedEpisodesCount
             }
 
@@ -1226,7 +1229,7 @@ private fun HistorialTabView(
                                     .padding(horizontal = 8.dp, vertical = 3.dp)
                             ) {
                                 Text(
-                                    text = "$watchedEps / $totalEps",
+                                    text = "$watchedEps / $totalEpsLabel",
                                     color = WakuText,
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold

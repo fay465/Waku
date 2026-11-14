@@ -1746,7 +1746,9 @@ private fun savePlaybackProgressToFirestore(
         updatedWatched.add(data.episodeNumber)
     }
 
+    // Solo se da por finalizada la serie si se conoce el total real (> 0) y ya se completó ese último episodio
     val allSeriesCompleted = data.totalEpisodes > 0 &&
+            (!data.isAiring || data.episodeNumber >= data.totalEpisodes) &&
             updatedWatched.size >= data.totalEpisodes &&
             data.episodeNumber >= data.totalEpisodes &&
             isEpisodeCompleted
@@ -1757,6 +1759,7 @@ private fun savePlaybackProgressToFirestore(
         put("title", data.animeTitle)
         if (data.posterUrl.isNotBlank()) put("posterUrl", data.posterUrl)
         put("totalEpisodes", data.totalEpisodes)
+        put("isAiring", data.isAiring)
         put("watchedEpisodes", updatedWatched.toList())
         val thumbEp = if (isEpisodeCompleted && data.hasNextEpisode) data.episodeNumber + 1 else data.episodeNumber
         put("imageUrl", "https://cdn.animeav1.com/screenshots/${data.animeId}/$thumbEp.jpg")
@@ -1783,6 +1786,14 @@ private fun savePlaybackProgressToFirestore(
             put("progress", 0.02f)
             put("badgeText", "Sig. Ep. ${data.episodeNumber + 1}")
             put("isNextEpisode", true)
+        } else if (isEpisodeCompleted && data.isAiring) {
+            // Está al día con el último capítulo emitido de un anime en emisión
+            put("estado", "VIENDO")
+            put("episodioActual", data.episodeNumber)
+            put("episodeTitle", data.episodeTitle)
+            put("progress", 1.0f)
+            put("badgeText", "Al día • Ep. ${data.episodeNumber}")
+            put("isNextEpisode", false)
         } else {
             put("estado", "VIENDO")
             put("episodioActual", data.episodeNumber)

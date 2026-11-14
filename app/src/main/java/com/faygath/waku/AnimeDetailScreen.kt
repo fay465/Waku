@@ -460,6 +460,17 @@ fun AnimeMetadataSection(data: AnimeDetailData) {
     var synopsisExpanded by remember(data.synopsis) { mutableStateOf(false) }
     var isSynopsisOverflowing by remember(data.synopsis) { mutableStateOf(false) }
 
+    val episodesHeaderLabel = when {
+        data.isAiring && data.totalEpisodes > data.episodes.size ->
+            "${data.episodes.size} / ${data.totalEpisodes} Episodios"
+        data.isAiring && data.totalEpisodes == 0 ->
+            "${data.episodes.size} / ? Episodios"
+        data.totalEpisodes > 0 ->
+            "${data.totalEpisodes} Episodios"
+        else ->
+            "${data.episodes.size} Episodios"
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -522,7 +533,7 @@ fun AnimeMetadataSection(data: AnimeDetailData) {
             DotSeparator()
 
             Text(
-                text = "${data.totalEpisodes} Episodios",
+                text = episodesHeaderLabel,
                 color = Color(0xFFE4BEB7),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium
@@ -950,10 +961,11 @@ private fun toggleEpisodeWatchedFirestore(
         updatedSet.add(episodeNumber)
     }
 
-    val nextUnwatched = (1..data.totalEpisodes.coerceAtLeast(1))
-        .firstOrNull { !updatedSet.contains(it) } ?: data.totalEpisodes.coerceAtLeast(1)
+    val maxKnownEp = maxOf(data.totalEpisodes, data.episodes.size, 1)
+    val nextUnwatched = (1..maxKnownEp)
+        .firstOrNull { !updatedSet.contains(it) } ?: maxKnownEp
 
-    val allWatched = data.totalEpisodes > 0 && updatedSet.size >= data.totalEpisodes
+    val allWatched = !data.isAiring && data.totalEpisodes > 0 && updatedSet.size >= data.totalEpisodes
 
     val payload = mapOf(
         "animeId" to data.animeId,
@@ -961,6 +973,7 @@ private fun toggleEpisodeWatchedFirestore(
         "title" to data.title,
         "posterUrl" to data.posterUrl,
         "totalEpisodes" to data.totalEpisodes,
+        "isAiring" to data.isAiring,
         "watchedEpisodes" to updatedSet.toList(),
         "episodioActual" to nextUnwatched,
         "estado" to if (allWatched) "FINALIZADO" else "VIENDO",
