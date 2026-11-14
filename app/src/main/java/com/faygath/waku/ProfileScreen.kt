@@ -1,5 +1,6 @@
 package com.faygath.waku
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -43,11 +44,13 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -57,10 +60,12 @@ import coil.compose.AsyncImage
 import com.faygath.waku.ui.theme.*
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
 import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.tasks.await
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.TextStyle as JavaTextStyle
@@ -73,12 +78,24 @@ val FaceTopAlignment = BiasAlignment(horizontalBias = 0f, verticalBias = -0.60f)
 private const val DEFAULT_ANILIST_AVATAR =
     "https://s4.anilist.co/file/anilistcdn/character/large/b138101-768222I9331P.png"
 
+private enum class UsernameAvailability {
+    TOO_SHORT,
+    CHECKING,
+    AVAILABLE,
+    TAKEN
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(
+    isMandatorySetup: Boolean = false,
     onNavigateTab: (String) -> Unit,
-    onLogoutSuccess: () -> Unit
+    onLogoutSuccess: () -> Unit,
+    onSetupCompleted: () -> Unit = {}
 ) {
+    // Si está en modo configuración obligatoria de primer ingreso, bloquea el botón físico Atrás
+    BackHandler(enabled = isMandatorySetup) {}
+
     val focusManager = LocalFocusManager.current
     val usernameFocusRequester = remember { FocusRequester() }
 
@@ -106,12 +123,31 @@ fun ProfileScreen(
 
     var selectedAvatarUrl by remember { mutableStateOf(DEFAULT_ANILIST_AVATAR) }
     var displayedUsername by remember {
-        mutableStateOf(
+        val initialName = if (isMandatorySetup) {
+            ""
+        } else {
             currentUser?.displayName?.takeIf { it.isNotBlank() }
                 ?: userEmail.substringBefore("@").replaceFirstChar { it.uppercase() }
+        }
+        mutableStateOf(initialName)
+    }
+
+    // TextFieldValue mantiene el cursor siempre al final del texto para evitar escribir al principio
+    var usernameField by remember {
+        mutableStateOf(
+            TextFieldValue(
+                text = displayedUsername,
+                selection = TextRange(displayedUsername.length)
+            )
         )
     }
-    var usernameInput by remember { mutableStateOf(displayedUsername) }
+    var isUsernameFocused by remember { mutableStateOf(false) }
+    var usernameAvailability by remember {
+        mutableStateOf(
+            if (displayedUsername.length >= 3) UsernameAvailability.AVAILABLE
+            else UsernameAvailability.TOO_SHORT
+        )
+    }
 
     // Estado para abrir el Modal Selector de Avatares por Serie
     var showAvatarPickerSheet by remember { mutableStateOf(false) }
@@ -120,6 +156,7 @@ fun ProfileScreen(
     var currentPassword by remember { mutableStateOf("") }
     var newPassword by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
+    var requireCurrentPwdForSetup by remember { mutableStateOf(false) }
 
     var showCurrentPwd by remember { mutableStateOf(false) }
     var showNewPwd by remember { mutableStateOf(false) }
@@ -151,7 +188,7 @@ fun ProfileScreen(
         label = "avatarPop"
     )
 
-    // Cargar datos actuales del usuario desde Firestore y completar campos faltantes automáticamente
+    // 1. Cargar datos actuales del usuario desde Firestore
     LaunchedEffect(uid) {
         if (uid != null) {
             val userRef = db.collection("usuarios").document(uid)
@@ -164,36 +201,81 @@ fun ProfileScreen(
                         val savedName = doc.getString("username")
                             ?: doc.getString("nombreUsuario")
                             ?: doc.getString("nombre")
-                        if (!savedName.isNullOrBlank()) {
+                        if (!savedName.isNullOrBlank() && !isMandatorySetup) {
                             displayedUsername = savedName
-                            usernameInput = savedName
+                            if (!isUsernameFocused) {
+                                usernameField = TextFieldValue(
+                                    text = savedName,
+                                    selection = TextRange(savedName.length)
+                                )
+                            }
                         }
                         val savedMemberSince = doc.getString("memberSince")?.trim()
                         if (!savedMemberSince.isNullOrBlank()) {
                             memberSinceRaw = savedMemberSince
                         }
 
-                        // Si al documento le faltaba email, username o memberSince (como le pasó a tu amigo), lo repara al instante
-                        val missingFixes = mutableMapOf<String, Any>()
-                        if (doc.getString("email").isNullOrBlank() && userEmail.isNotBlank()) {
-                            missingFixes["email"] = userEmail
-                        }
-                        if (savedName.isNullOrBlank()) {
-                            missingFixes["username"] = displayedUsername
-                        }
-                        if (savedMemberSince.isNullOrBlank()) {
-                            missingFixes["memberSince"] = memberSinceRaw
-                        }
-                        if (missingFixes.isNotEmpty()) {
-                            missingFixes["updatedAt"] = System.currentTimeMillis()
-                            userRef.set(missingFixes, SetOptions.merge())
+                        if (!isMandatorySetup) {
+                            val missingFixes = mutableMapOf<String, Any>()
+                            if (doc.getString("email").isNullOrBlank() && userEmail.isNotBlank()) {
+                                missingFixes["email"] = userEmail
+                            }
+                            if (savedName.isNullOrBlank() && displayedUsername.isNotBlank()) {
+                                missingFixes["username"] = displayedUsername
+                            }
+                            if (savedMemberSince.isNullOrBlank()) {
+                                missingFixes["memberSince"] = memberSinceRaw
+                            }
+                            if (missingFixes.isNotEmpty()) {
+                                missingFixes["updatedAt"] = System.currentTimeMillis()
+                                userRef.set(missingFixes, SetOptions.merge())
+                            }
                         }
                     }
                 }
         }
     }
 
-    // Validación amigable: mínimo 6 caracteres (estándar de Firebase Auth)
+    // 2. Verificación en tiempo real (con debounce) de que el nombre de usuario sea único en Firestore
+    LaunchedEffect(usernameField.text, displayedUsername, uid) {
+        val clean = usernameField.text.trim()
+        if (clean.length < 3) {
+            usernameAvailability = UsernameAvailability.TOO_SHORT
+            return@LaunchedEffect
+        }
+        if (!isMandatorySetup && clean.equals(displayedUsername, ignoreCase = true)) {
+            usernameAvailability = UsernameAvailability.AVAILABLE
+            return@LaunchedEffect
+        }
+
+        usernameAvailability = UsernameAvailability.CHECKING
+        delay(350)
+
+        val candidates = listOf(
+            clean,
+            clean.lowercase(),
+            clean.uppercase(),
+            clean.replaceFirstChar { it.uppercase() },
+            clean.lowercase().replaceFirstChar { it.uppercase() }
+        ).distinct()
+
+        val isTaken = runCatching {
+            val snap = db.collection("usuarios")
+                .whereIn("username", candidates)
+                .get()
+                .await()
+            snap.documents.any { doc ->
+                doc.id != uid && doc.getString("username")?.trim().equals(clean, ignoreCase = true)
+            }
+        }.getOrDefault(false)
+
+        usernameAvailability = if (isTaken) {
+            UsernameAvailability.TAKEN
+        } else {
+            UsernameAvailability.AVAILABLE
+        }
+    }
+
     val hasValidNewPassword = remember(newPassword) {
         newPassword.length >= 6
     }
@@ -202,19 +284,22 @@ fun ProfileScreen(
         containerColor = WakuBg,
         topBar = {
             ProfileTopBar(
+                showSearchIcon = !isMandatorySetup,
                 onSearchClick = { onNavigateTab("catalogo_search") }
             )
         },
         bottomBar = {
-            WakuBottomNavBar(
-                selectedRoute = "perfil",
-                avatarUrl = selectedAvatarUrl,
-                onSelectRoute = { route ->
-                    if (route != "perfil") {
-                        onNavigateTab(route)
+            if (!isMandatorySetup) {
+                WakuBottomNavBar(
+                    selectedRoute = "perfil",
+                    avatarUrl = selectedAvatarUrl,
+                    onSelectRoute = { route ->
+                        if (route != "perfil") {
+                            onNavigateTab(route)
+                        }
                     }
-                }
-            )
+                )
+            }
         }
     ) { innerPadding ->
         Box(
@@ -234,13 +319,13 @@ fun ProfileScreen(
                         bottom = innerPadding.calculateBottomPadding() + 32.dp
                     )
             ) {
-                // 1. CABECERA LIMPIA: "Mi Perfil •" (Sin el badge de Plan Premium)
+                // 1. CABECERA
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        text = "Mi Perfil",
+                        text = if (isMandatorySetup) "Configura tu Cuenta" else "Mi Perfil",
                         color = WakuText,
                         fontSize = 26.sp,
                         fontWeight = FontWeight.Bold
@@ -254,9 +339,36 @@ fun ProfileScreen(
                     )
                 }
 
+                if (isMandatorySetup) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFF241E1C))
+                            .border(1.dp, WakuGold.copy(alpha = 0.40f), RoundedCornerShape(14.dp))
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "✦",
+                            color = WakuGold,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "¡Bienvenido a Waku! Como es tu primer ingreso, elige un nombre de usuario único, tu avatar y define tu contraseña personal.",
+                            color = Color(0xFFE4BEB7),
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
+                        )
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(18.dp))
 
-                // 2. AVATAR CENTRAL CON BORDE DORADO Y BOTÓN DE LÁPIZ (Abre el catálogo de avatares de AniList)
+                // 2. AVATAR CENTRAL CON BORDE DORADO Y BOTÓN DE LÁPIZ
                 Column(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -305,7 +417,6 @@ fun ProfileScreen(
                             )
                         }
 
-                        // Botón flotante con Lápiz (recorte circular antes del clickable)
                         Box(
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
@@ -337,7 +448,9 @@ fun ProfileScreen(
                         horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         Text(
-                            text = displayedUsername,
+                            text = displayedUsername.ifBlank {
+                                usernameField.text.trim().ifBlank { "Nuevo Miembro" }
+                            },
                             color = WakuText,
                             fontSize = 20.sp,
                             fontWeight = FontWeight.Bold
@@ -365,7 +478,7 @@ fun ProfileScreen(
                 ProfileSectionHeader(
                     icon = Icons.Outlined.Badge,
                     title = "DATOS DE LA CUENTA",
-                    rightStatus = "SINCRONIZADO"
+                    rightStatus = if (isMandatorySetup) "PASO 1 DE 2" else "SINCRONIZADO"
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -430,6 +543,13 @@ fun ProfileScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
+                val statusTextAndColor = when (usernameAvailability) {
+                    UsernameAvailability.TOO_SHORT -> "MÍN. 3 LETRAS" to WakuGold
+                    UsernameAvailability.CHECKING -> "VERIFICANDO..." to WakuGold
+                    UsernameAvailability.AVAILABLE -> "✓ DISPONIBLE" to WakuGreen
+                    UsernameAvailability.TAKEN -> "✕ YA EN USO" to WakuPink
+                }
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -444,8 +564,8 @@ fun ProfileScreen(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = if (usernameInput.trim().length >= 3) "DISPONIBLE" else "MÍN. 3 LETRAS",
-                        color = if (usernameInput.trim().length >= 3) WakuGreen else WakuGold,
+                        text = statusTextAndColor.first,
+                        color = statusTextAndColor.second,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 1.sp
@@ -453,10 +573,15 @@ fun ProfileScreen(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
 
-                var isUsernameFocused by remember { mutableStateOf(false) }
+                val usernameBorderColor = when {
+                    usernameAvailability == UsernameAvailability.TAKEN -> WakuPrimary
+                    isUsernameFocused -> WakuPrimary
+                    else -> Color.Transparent
+                }
+
                 BasicTextField(
-                    value = usernameInput,
-                    onValueChange = { usernameInput = it },
+                    value = usernameField,
+                    onValueChange = { usernameField = it },
                     singleLine = true,
                     textStyle = TextStyle(
                         color = WakuText,
@@ -467,7 +592,20 @@ fun ProfileScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusRequester(usernameFocusRequester)
-                        .onFocusChanged { isUsernameFocused = it.isFocused },
+                        .onFocusChanged { focusState ->
+                            if (focusState.isFocused && !isUsernameFocused) {
+                                // Si al tocar el campo el cursor cayó en 0, lo mueve automáticamente al final
+                                if (usernameField.selection.start == 0 &&
+                                    usernameField.selection.end == 0 &&
+                                    usernameField.text.isNotEmpty()
+                                ) {
+                                    usernameField = usernameField.copy(
+                                        selection = TextRange(usernameField.text.length)
+                                    )
+                                }
+                            }
+                            isUsernameFocused = focusState.isFocused
+                        },
                     decorationBox = { innerField ->
                         Row(
                             modifier = Modifier
@@ -477,7 +615,7 @@ fun ProfileScreen(
                                 .background(if (isUsernameFocused) Color(0xFF2F2926) else Color(0xFF241E1C))
                                 .border(
                                     width = 1.dp,
-                                    color = if (isUsernameFocused) WakuPrimary else Color.Transparent,
+                                    color = usernameBorderColor,
                                     shape = RoundedCornerShape(16.dp)
                                 )
                                 .padding(horizontal = 14.dp),
@@ -491,9 +629,9 @@ fun ProfileScreen(
                             )
                             Spacer(modifier = Modifier.width(12.dp))
                             Box(modifier = Modifier.weight(1f)) {
-                                if (usernameInput.isEmpty()) {
+                                if (usernameField.text.isEmpty()) {
                                     Text(
-                                        text = "Ingresa tu apodo",
+                                        text = "Elige tu nombre de usuario único",
                                         color = Color(0xFFAA8983),
                                         fontSize = 15.sp
                                     )
@@ -501,7 +639,12 @@ fun ProfileScreen(
                                 innerField()
                             }
                             IconButton(
-                                onClick = { usernameFocusRequester.requestFocus() },
+                                onClick = {
+                                    usernameField = usernameField.copy(
+                                        selection = TextRange(usernameField.text.length)
+                                    )
+                                    usernameFocusRequester.requestFocus()
+                                },
                                 modifier = Modifier.size(28.dp)
                             ) {
                                 Icon(
@@ -520,29 +663,31 @@ fun ProfileScreen(
                 // 4. SECCIÓN: CAMBIAR CONTRASEÑA
                 ProfileSectionHeader(
                     icon = Icons.Outlined.LockReset,
-                    title = "CAMBIAR CONTRASEÑA",
-                    rightStatus = "SEGURIDAD SSL"
+                    title = if (isMandatorySetup) "CREA TU CONTRASEÑA PERSONAL" else "CAMBIAR CONTRASEÑA",
+                    rightStatus = if (isMandatorySetup) "PASO 2 DE 2 • OBLIGATORIO" else "SEGURIDAD SSL"
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                ProfilePasswordField(
-                    label = "Contraseña Actual",
-                    value = currentPassword,
-                    onValueChange = { currentPassword = it },
-                    placeholder = "••••••••••••",
-                    leadingIcon = Icons.Outlined.VpnKey,
-                    isVisible = showCurrentPwd,
-                    onToggleVisibility = { showCurrentPwd = !showCurrentPwd }
-                )
+                if (!isMandatorySetup || requireCurrentPwdForSetup) {
+                    ProfilePasswordField(
+                        label = if (isMandatorySetup) "Contraseña Temporal Actual" else "Contraseña Actual",
+                        value = currentPassword,
+                        onValueChange = { currentPassword = it },
+                        placeholder = "••••••••••••",
+                        leadingIcon = Icons.Outlined.VpnKey,
+                        isVisible = showCurrentPwd,
+                        onToggleVisibility = { showCurrentPwd = !showCurrentPwd }
+                    )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
 
                 ProfilePasswordField(
                     label = "Nueva Contraseña",
                     value = newPassword,
                     onValueChange = { newPassword = it },
-                    placeholder = "Mínimo 8 caracteres",
+                    placeholder = "Mínimo 6 caracteres",
                     leadingIcon = Icons.Outlined.Password,
                     isVisible = showNewPwd,
                     onToggleVisibility = { showNewPwd = !showNewPwd }
@@ -582,97 +727,148 @@ fun ProfileScreen(
 
                 Spacer(modifier = Modifier.height(26.dp))
 
-                // 5. BOTONES DE ACCIÓN: GUARDAR CAMBIOS & CERRAR SESIÓN
+                // 5. BOTÓN DE ACCIÓN PRINCIPAL
                 Button(
                     onClick = {
                         focusManager.clearFocus()
-                        val cleanName = usernameInput.trim()
+                        val cleanName = usernameField.text.trim()
                         if (cleanName.length < 3) {
                             isErrorNotice = true
                             noticeMessage = "El nombre de usuario debe tener al menos 3 caracteres"
                             return@Button
                         }
+                        if (usernameAvailability == UsernameAvailability.TAKEN) {
+                            isErrorNotice = true
+                            noticeMessage = "El nombre '$cleanName' ya está ocupado. Elige otro distinto."
+                            return@Button
+                        }
 
+                        val wantsPasswordChange = isMandatorySetup ||
+                                currentPassword.isNotBlank() ||
+                                newPassword.isNotBlank() ||
+                                confirmPassword.isNotBlank()
+
+                        if (wantsPasswordChange) {
+                            if ((!isMandatorySetup || requireCurrentPwdForSetup) && currentPassword.isBlank()) {
+                                isErrorNotice = true
+                                noticeMessage = "Ingresa tu contraseña actual para poder cambiarla"
+                                return@Button
+                            }
+                            if (!hasValidNewPassword) {
+                                isErrorNotice = true
+                                noticeMessage = "Debes definir una nueva contraseña de mínimo 6 caracteres"
+                                return@Button
+                            }
+                            if (newPassword != confirmPassword) {
+                                isErrorNotice = true
+                                noticeMessage = "La nueva contraseña y su confirmación no coinciden"
+                                return@Button
+                            }
+                        }
+
+                        if (uid == null || currentUser == null) return@Button
                         isSaving = true
 
-                        // 1. SIEMPRE guardamos primero los datos del perfil en Firestore y Auth
-                        if (uid != null) {
+                        val proceedWithSave = {
                             val profileData = mapOf(
                                 "username" to cleanName,
                                 "avatarUrl" to selectedAvatarUrl,
                                 "email" to userEmail,
                                 "memberSince" to memberSinceRaw,
+                                "mustCompleteSetup" to false,
                                 "updatedAt" to System.currentTimeMillis()
                             )
-                            db.collection("usuarios").document(uid)
-                                .set(profileData, SetOptions.merge())
-                        }
 
-                        val profileUpdates = UserProfileChangeRequest.Builder()
-                            .setDisplayName(cleanName)
-                            .build()
-                        currentUser?.updateProfile(profileUpdates)
-                        displayedUsername = cleanName
+                            val profileUpdates = UserProfileChangeRequest.Builder()
+                                .setDisplayName(cleanName)
+                                .build()
+                            currentUser.updateProfile(profileUpdates)
+                            displayedUsername = cleanName
 
-                        // 2. Si además llenó algún campo de contraseña, validamos y actualizamos la clave
-                        val wantsPasswordChange = currentPassword.isNotBlank() ||
-                                newPassword.isNotBlank() ||
-                                confirmPassword.isNotBlank()
-
-                        if (wantsPasswordChange) {
-                            if (currentPassword.isBlank()) {
-                                isSaving = false
-                                isErrorNotice = true
-                                noticeMessage = "Nombre guardado. Para cambiar la clave, ingresa tu contraseña actual."
-                                return@Button
-                            }
-                            if (!hasValidNewPassword) {
-                                isSaving = false
-                                isErrorNotice = true
-                                noticeMessage = "Nombre guardado. La nueva contraseña requiere mínimo 6 caracteres."
-                                return@Button
-                            }
-                            if (newPassword != confirmPassword) {
-                                isSaving = false
-                                isErrorNotice = true
-                                noticeMessage = "Nombre guardado. La nueva contraseña y su confirmación no coinciden."
-                                return@Button
-                            }
-
-                            if (currentUser != null && currentUser.email != null) {
-                                val credential = EmailAuthProvider.getCredential(currentUser.email!!, currentPassword)
-                                currentUser.reauthenticate(credential)
-                                    .addOnSuccessListener {
-                                        currentUser.updatePassword(newPassword)
-                                            .addOnSuccessListener {
-                                                isSaving = false
-                                                currentPassword = ""
-                                                newPassword = ""
-                                                confirmPassword = ""
-                                                isErrorNotice = false
-                                                noticeMessage = "Perfil y contraseña actualizados con éxito"
-                                            }
-                                            .addOnFailureListener { err ->
-                                                isSaving = false
-                                                isErrorNotice = true
+                            if (wantsPasswordChange) {
+                                val applyNewPassword = {
+                                    currentUser.updatePassword(newPassword)
+                                        .addOnSuccessListener {
+                                            db.collection("usuarios").document(uid)
+                                                .set(profileData, SetOptions.merge())
+                                                .addOnCompleteListener {
+                                                    isSaving = false
+                                                    currentPassword = ""
+                                                    newPassword = ""
+                                                    confirmPassword = ""
+                                                    isErrorNotice = false
+                                                    if (isMandatorySetup) {
+                                                        onSetupCompleted()
+                                                    } else {
+                                                        noticeMessage = "Perfil y contraseña actualizados con éxito"
+                                                    }
+                                                }
+                                        }
+                                        .addOnFailureListener { err ->
+                                            isSaving = false
+                                            isErrorNotice = true
+                                            if (err is FirebaseAuthRecentLoginRequiredException) {
+                                                requireCurrentPwdForSetup = true
+                                                noticeMessage = "Por seguridad, ingresa tu contraseña temporal actual arriba."
+                                            } else {
                                                 noticeMessage = err.localizedMessage ?: "Error al actualizar la contraseña"
                                             }
-                                    }
-                                    .addOnFailureListener {
-                                        isSaving = false
-                                        isErrorNotice = true
-                                        noticeMessage = "Nombre guardado, pero la contraseña actual ingresada es incorrecta"
-                                    }
+                                        }
+                                }
+
+                                if (currentPassword.isNotBlank() && currentUser.email != null) {
+                                    val credential = EmailAuthProvider.getCredential(currentUser.email!!, currentPassword)
+                                    currentUser.reauthenticate(credential)
+                                        .addOnSuccessListener { applyNewPassword() }
+                                        .addOnFailureListener {
+                                            isSaving = false
+                                            isErrorNotice = true
+                                            noticeMessage = "La contraseña actual ingresada es incorrecta"
+                                        }
+                                } else {
+                                    applyNewPassword()
+                                }
                             } else {
-                                isSaving = false
+                                db.collection("usuarios").document(uid)
+                                    .set(profileData, SetOptions.merge())
+                                    .addOnCompleteListener {
+                                        isSaving = false
+                                        isErrorNotice = false
+                                        noticeMessage = "Perfil actualizado con éxito"
+                                    }
                             }
-                        } else {
-                            isSaving = false
-                            isErrorNotice = false
-                            noticeMessage = "Perfil actualizado con éxito"
                         }
+
+                        // Comprobación final contra Firestore antes de escribir para garantizar unicidad absoluta
+                        val candidates = listOf(
+                            cleanName,
+                            cleanName.lowercase(),
+                            cleanName.uppercase(),
+                            cleanName.replaceFirstChar { it.uppercase() },
+                            cleanName.lowercase().replaceFirstChar { it.uppercase() }
+                        ).distinct()
+
+                        db.collection("usuarios")
+                            .whereIn("username", candidates)
+                            .get()
+                            .addOnSuccessListener { snap ->
+                                val takenByOther = snap.documents.any { doc ->
+                                    doc.id != uid && doc.getString("username")?.trim().equals(cleanName, ignoreCase = true)
+                                }
+                                if (takenByOther) {
+                                    isSaving = false
+                                    usernameAvailability = UsernameAvailability.TAKEN
+                                    isErrorNotice = true
+                                    noticeMessage = "El nombre '$cleanName' ya está en uso por otro miembro"
+                                } else {
+                                    proceedWithSave()
+                                }
+                            }
+                            .addOnFailureListener {
+                                proceedWithSave()
+                            }
                     },
-                    enabled = !isSaving,
+                    enabled = !isSaving && usernameAvailability != UsernameAvailability.CHECKING,
                     shape = CircleShape,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = WakuPrimary,
@@ -702,7 +898,7 @@ fun ProfileScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Guardar Cambios",
+                            text = if (isMandatorySetup) "Completar Registro y Entrar" else "Guardar Cambios",
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -806,7 +1002,7 @@ fun ProfileScreen(
                         selectedAvatarUrl = charItem.imageUrl
                         avatarPopTrigger = true
                         showAvatarPickerSheet = false
-                        if (uid != null) {
+                        if (uid != null && !isMandatorySetup) {
                             db.collection("usuarios").document(uid)
                                 .set(
                                     mapOf(
@@ -820,7 +1016,7 @@ fun ProfileScreen(
                                 )
                         }
                         isErrorNotice = false
-                        noticeMessage = "Avatar de ${charItem.name} aplicado"
+                        noticeMessage = "Avatar de ${charItem.name} seleccionado"
                     },
                     onClose = { showAvatarPickerSheet = false }
                 )
@@ -829,13 +1025,6 @@ fun ProfileScreen(
     }
 }
 
-/**
- * Contenido del Modal de Avatares:
- * - Buscador propio arriba para encontrar personajes de cualquier anime en AniList.
- * - Formato por secciones:
- *     Nombre Serie ──────────────
- *     [Avatar 1]  [Avatar 2]  [Avatar 3]
- */
 @Composable
 private fun AvatarPickerSheetContent(
     currentAvatarUrl: String,
@@ -876,7 +1065,6 @@ private fun AvatarPickerSheetContent(
             .navigationBarsPadding()
             .padding(horizontal = 20.dp)
     ) {
-        // Cabecera del Modal
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -915,7 +1103,6 @@ private fun AvatarPickerSheetContent(
             }
         }
 
-        // Buscador de series dentro del modal
         var isSearchFocused by remember { mutableStateOf(false) }
         BasicTextField(
             value = searchQuery,
@@ -1026,7 +1213,6 @@ private fun AvatarPickerSheetContent(
             ) {
                 items(seriesGroups, key = { it.animeId }) { group ->
                     Column(modifier = Modifier.fillMaxWidth()) {
-                        // CABECERA DE LA SERIE: "Nombre Serie ────────────────"
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.fillMaxWidth()
@@ -1051,7 +1237,6 @@ private fun AvatarPickerSheetContent(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        // Filas de 3 avatares por serie
                         val rows = group.characters.chunked(3)
                         Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                             rows.forEach { rowChars ->
@@ -1131,7 +1316,6 @@ private fun AvatarPickerSheetContent(
                                         }
                                     }
 
-                                    // Rellenar espacios si una fila tiene menos de 3 personajes para mantener la alineación
                                     repeat(3 - rowChars.size) {
                                         Spacer(modifier = Modifier.width(92.dp))
                                     }
@@ -1146,7 +1330,10 @@ private fun AvatarPickerSheetContent(
 }
 
 @Composable
-private fun ProfileTopBar(onSearchClick: () -> Unit) {
+private fun ProfileTopBar(
+    showSearchIcon: Boolean = true,
+    onSearchClick: () -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1174,13 +1361,15 @@ private fun ProfileTopBar(onSearchClick: () -> Unit) {
             )
         }
 
-        IconButton(onClick = onSearchClick) {
-            Icon(
-                imageVector = Icons.Outlined.Search,
-                contentDescription = "Buscar",
-                tint = Color(0xFFE4BEB7),
-                modifier = Modifier.size(24.dp)
-            )
+        if (showSearchIcon) {
+            IconButton(onClick = onSearchClick) {
+                Icon(
+                    imageVector = Icons.Outlined.Search,
+                    contentDescription = "Buscar",
+                    tint = Color(0xFFE4BEB7),
+                    modifier = Modifier.size(24.dp)
+                )
+            }
         }
     }
 }

@@ -96,6 +96,16 @@ class MainActivity : ComponentActivity() {
                                             return@addSnapshotListener
                                         }
 
+                                        val mustCompleteSetup = snap.getBoolean("mustCompleteSetup") == true
+                                        if (mustCompleteSetup) {
+                                            if (currentRoute != "setup_profile") {
+                                                navController.navigate("setup_profile") {
+                                                    popUpTo(0) { inclusive = true }
+                                                }
+                                            }
+                                            return@addSnapshotListener
+                                        }
+
                                         // Autorreparar campos faltantes si el usuario ya tenía sesión abierta de una versión anterior
                                         if (!hasAutoHealedProfile) {
                                             hasAutoHealedProfile = true
@@ -227,13 +237,31 @@ class MainActivity : ComponentActivity() {
                 ) {
                     composable("login") {
                         LoginScreen(
-                            onLoginSuccess = {
-                                navController.navigate("home") {
+                            onLoginSuccess = { requiresSetup ->
+                                val target = if (requiresSetup) "setup_profile" else "home"
+                                navController.navigate(target) {
                                     popUpTo("login") { inclusive = true }
                                 }
                             },
                             onForgotPasswordClick = {
                                 navController.navigate("forgot_password")
+                            }
+                        )
+                    }
+
+                    composable("setup_profile") {
+                        ProfileScreen(
+                            isMandatorySetup = true,
+                            onNavigateTab = navigateBottomTab,
+                            onLogoutSuccess = {
+                                navController.navigate("login") {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            },
+                            onSetupCompleted = {
+                                navController.navigate("home") {
+                                    popUpTo(0) { inclusive = true }
+                                }
                             }
                         )
                     }

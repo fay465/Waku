@@ -89,7 +89,7 @@ private fun verifyOrBindDeviceOnLogin(
     context: android.content.Context,
     db: com.google.firebase.firestore.FirebaseFirestore,
     auth: com.google.firebase.auth.FirebaseAuth,
-    onSuccess: () -> Unit,
+    onSuccess: (Boolean) -> Unit,
     onError: (String) -> Unit
 ) {
     val currentUser = auth.currentUser
@@ -161,17 +161,21 @@ private fun verifyOrBindDeviceOnLogin(
                 val defaultUsername = currentUser.displayName?.trim()?.takeIf { it.isNotEmpty() }
                     ?: authEmail.substringBefore("@").replaceFirstChar { it.uppercase() }.ifBlank { "Usuario" }
 
+                val isFirstTimeEver = !doc.exists()
+                val mustCompleteSetup = doc.getBoolean("mustCompleteSetup") ?: isFirstTimeEver
+
                 val updateData = mutableMapOf<String, Any>(
                     "boundDeviceIds" to boundIds,
                     "boundDeviceNames" to boundNames,
                     "maxDevices" to maxAllowed,
+                    "mustCompleteSetup" to mustCompleteSetup,
                     "lastLoginAt" to now
                 )
 
                 if (existingEmail.isEmpty() && authEmail.isNotEmpty()) {
                     updateData["email"] = authEmail
                 }
-                if (existingUsername.isEmpty()) {
+                if (existingUsername.isEmpty() && !mustCompleteSetup) {
                     updateData["username"] = defaultUsername
                 }
                 if (existingMemberSince.isEmpty()) {
@@ -185,8 +189,8 @@ private fun verifyOrBindDeviceOnLogin(
                 }
 
                 userRef.set(updateData, com.google.firebase.firestore.SetOptions.merge())
-                    .addOnSuccessListener { onSuccess() }
-                    .addOnFailureListener { onSuccess() }
+                    .addOnSuccessListener { onSuccess(mustCompleteSetup) }
+                    .addOnFailureListener { onSuccess(mustCompleteSetup) }
             } else {
                 auth.signOut()
                 val registeredDevicesText = if (boundNames.isNotEmpty()) {
@@ -205,7 +209,7 @@ private fun verifyOrBindDeviceOnLogin(
 
 @Composable
 fun LoginScreen(
-    onLoginSuccess: () -> Unit,
+    onLoginSuccess: (Boolean) -> Unit,
     onForgotPasswordClick: () -> Unit
 ) {
     var usernameOrEmail by remember { mutableStateOf("") }
@@ -467,9 +471,9 @@ fun LoginScreen(
                                     context = context,
                                     db = db,
                                     auth = auth,
-                                    onSuccess = {
+                                    onSuccess = { requiresSetup ->
                                         isLoading = false
-                                        onLoginSuccess()
+                                        onLoginSuccess(requiresSetup)
                                     },
                                     onError = { msg ->
                                         isLoading = false
