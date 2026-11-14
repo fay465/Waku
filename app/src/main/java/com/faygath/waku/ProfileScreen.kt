@@ -8,6 +8,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -43,6 +45,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -98,6 +102,7 @@ fun ProfileScreen(
 
     val focusManager = LocalFocusManager.current
     val usernameFocusRequester = remember { FocusRequester() }
+    val scrollState = rememberScrollState()
 
     val auth = remember { FirebaseAuth.getInstance() }
     val db = remember { FirebaseFirestore.getInstance() }
@@ -142,11 +147,27 @@ fun ProfileScreen(
         )
     }
     var isUsernameFocused by remember { mutableStateOf(false) }
+    var usernameFieldY by remember { mutableIntStateOf(0) }
+    var usernameFieldHeight by remember { mutableIntStateOf(0) }
+
     var usernameAvailability by remember {
         mutableStateOf(
             if (displayedUsername.length >= 3) UsernameAvailability.AVAILABLE
             else UsernameAvailability.TOO_SHORT
         )
+    }
+
+    // Auto-centrar el campo de Nombre de Usuario cuando recibe foco o se abre el teclado
+    LaunchedEffect(isUsernameFocused, scrollState.maxValue) {
+        if (isUsernameFocused) {
+            delay(100)
+            val viewportH = scrollState.viewportSize
+            if (viewportH > 0) {
+                val target = (usernameFieldY - (viewportH / 2) + (usernameFieldHeight / 2))
+                    .coerceIn(0, scrollState.maxValue)
+                scrollState.animateScrollTo(target)
+            }
+        }
     }
 
     // Estado para abrir el Modal Selector de Avatares por Serie
@@ -282,6 +303,7 @@ fun ProfileScreen(
 
     Scaffold(
         containerColor = WakuBg,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             ProfileTopBar(
                 showSearchIcon = !isMandatorySetup,
@@ -311,12 +333,13 @@ fun ProfileScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .imePadding()
+                    .verticalScroll(scrollState)
                     .padding(
                         start = 16.dp,
                         end = 16.dp,
                         top = 6.dp,
-                        bottom = innerPadding.calculateBottomPadding() + 32.dp
+                        bottom = innerPadding.calculateBottomPadding() + 36.dp
                     )
             ) {
                 // 1. CABECERA
@@ -588,9 +611,20 @@ fun ProfileScreen(
                         fontSize = 16.sp,
                         fontWeight = FontWeight.SemiBold
                     ),
+                    keyboardOptions = KeyboardOptions(
+                        imeAction = if (isMandatorySetup) ImeAction.Next else ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onNext = { focusManager.moveFocus(FocusDirection.Down) },
+                        onDone = { focusManager.clearFocus() }
+                    ),
                     cursorBrush = SolidColor(WakuPrimary),
                     modifier = Modifier
                         .fillMaxWidth()
+                        .onGloballyPositioned { coords ->
+                            usernameFieldY = coords.positionInParent().y.toInt()
+                            usernameFieldHeight = coords.size.height
+                        }
                         .focusRequester(usernameFocusRequester)
                         .onFocusChanged { focusState ->
                             if (focusState.isFocused && !isUsernameFocused) {
@@ -664,7 +698,7 @@ fun ProfileScreen(
                 ProfileSectionHeader(
                     icon = Icons.Outlined.LockReset,
                     title = if (isMandatorySetup) "CREA TU CONTRASEÑA PERSONAL" else "CAMBIAR CONTRASEÑA",
-                    rightStatus = if (isMandatorySetup) "PASO 2 DE 2 • OBLIGATORIO" else "SEGURIDAD SSL"
+                    rightStatus = if (isMandatorySetup) "PASO 2 DE 2" else "SEGURIDAD SSL"
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -677,7 +711,10 @@ fun ProfileScreen(
                         placeholder = "••••••••••••",
                         leadingIcon = Icons.Outlined.VpnKey,
                         isVisible = showCurrentPwd,
-                        onToggleVisibility = { showCurrentPwd = !showCurrentPwd }
+                        onToggleVisibility = { showCurrentPwd = !showCurrentPwd },
+                        scrollState = scrollState,
+                        imeAction = ImeAction.Next,
+                        onNextAction = { focusManager.moveFocus(FocusDirection.Down) }
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -690,7 +727,10 @@ fun ProfileScreen(
                     placeholder = "Mínimo 6 caracteres",
                     leadingIcon = Icons.Outlined.Password,
                     isVisible = showNewPwd,
-                    onToggleVisibility = { showNewPwd = !showNewPwd }
+                    onToggleVisibility = { showNewPwd = !showNewPwd },
+                    scrollState = scrollState,
+                    imeAction = ImeAction.Next,
+                    onNextAction = { focusManager.moveFocus(FocusDirection.Down) }
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -702,7 +742,10 @@ fun ProfileScreen(
                     placeholder = "Repetir nueva contraseña",
                     leadingIcon = Icons.Outlined.VerifiedUser,
                     isVisible = showConfirmPwd,
-                    onToggleVisibility = { showConfirmPwd = !showConfirmPwd }
+                    onToggleVisibility = { showConfirmPwd = !showConfirmPwd },
+                    scrollState = scrollState,
+                    imeAction = ImeAction.Done,
+                    onDoneAction = { focusManager.clearFocus() }
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
@@ -1389,7 +1432,10 @@ private fun ProfileSectionHeader(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .weight(1f, fill = false)
+                .padding(end = 12.dp)
         ) {
             Icon(
                 imageVector = icon,
@@ -1402,7 +1448,9 @@ private fun ProfileSectionHeader(
                 color = WakuGold,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
-                letterSpacing = 1.4.sp
+                letterSpacing = 1.2.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
 
@@ -1411,7 +1459,8 @@ private fun ProfileSectionHeader(
             color = Color(0xFFE4BEB7).copy(alpha = 0.60f),
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
-            letterSpacing = 1.sp
+            letterSpacing = 1.sp,
+            textAlign = TextAlign.End
         )
     }
 }
@@ -1424,11 +1473,37 @@ private fun ProfilePasswordField(
     placeholder: String,
     leadingIcon: ImageVector,
     isVisible: Boolean,
-    onToggleVisibility: () -> Unit
+    onToggleVisibility: () -> Unit,
+    scrollState: ScrollState,
+    imeAction: ImeAction = ImeAction.Next,
+    onNextAction: () -> Unit = {},
+    onDoneAction: () -> Unit = {}
 ) {
     var isFocused by remember { mutableStateOf(false) }
+    var fieldY by remember { mutableIntStateOf(0) }
+    var fieldHeight by remember { mutableIntStateOf(0) }
 
-    Column(modifier = Modifier.fillMaxWidth()) {
+    // Centra automáticamente este campo en el espacio visible sobre el teclado al enfocarlo
+    LaunchedEffect(isFocused, scrollState.maxValue) {
+        if (isFocused) {
+            delay(100)
+            val viewportH = scrollState.viewportSize
+            if (viewportH > 0) {
+                val target = (fieldY - (viewportH / 2) + (fieldHeight / 2))
+                    .coerceIn(0, scrollState.maxValue)
+                scrollState.animateScrollTo(target)
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { coords ->
+                fieldY = coords.positionInParent().y.toInt()
+                fieldHeight = coords.size.height
+            }
+    ) {
         Text(
             text = label,
             color = Color(0xFFE4BEB7).copy(alpha = 0.75f),
@@ -1447,7 +1522,14 @@ private fun ProfilePasswordField(
                 fontSize = 14.sp,
                 letterSpacing = if (isVisible || value.isEmpty()) 0.3.sp else 2.sp
             ),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = imeAction
+            ),
+            keyboardActions = KeyboardActions(
+                onNext = { onNextAction() },
+                onDone = { onDoneAction() }
+            ),
             visualTransformation = if (isVisible) VisualTransformation.None else PasswordVisualTransformation(),
             cursorBrush = SolidColor(WakuPrimary),
             modifier = Modifier
